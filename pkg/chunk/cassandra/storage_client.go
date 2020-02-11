@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"strings"
@@ -91,9 +92,18 @@ func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) {
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
 	if cfg.SSL {
-		cluster.SslOpts = &gocql.SslOptions{
-			CaPath:                 cfg.CAPath,
-			EnableHostVerification: cfg.HostVerification,
+		if cfg.HostVerification {
+			cluster.SslOpts = &gocql.SslOptions{
+				CaPath:                 cfg.CAPath,
+				EnableHostVerification: true,
+				Config: &tls.Config{
+					ServerName: strings.Split(cfg.Addresses, ",")[0], // TODO
+				},
+			}
+		} else {
+			cluster.SslOpts = &gocql.SslOptions{
+				EnableHostVerification: false,
+			}
 		}
 	}
 	if cfg.Auth {
