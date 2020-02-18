@@ -96,8 +96,8 @@ func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
 	serverNames := strings.Split(cfg.Addresses, ",")
 	if cfg.SSL {
 		if cfg.HostVerification {
-			if len(serverNames) > 1 {
-				return errors.New("using multiple hostnames and host verification is unsupported currently")
+			if len(serverNames) != 1 {
+				return errors.New("host verification is only possible for a single host")
 			}
 			cluster.SslOpts = &gocql.SslOptions{
 				CaPath:                 cfg.CAPath,
