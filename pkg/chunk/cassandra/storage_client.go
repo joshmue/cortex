@@ -82,22 +82,28 @@ func (cfg *Config) session() (*gocql.Session, error) {
 			Max:        cfg.MaxBackoff,
 		}
 	}
-	cfg.setClusterConfig(cluster)
+	if err := cfg.setClusterConfig(cluster); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
 	return cluster.CreateSession()
 }
 
 // apply config settings to a cassandra ClusterConfig
-func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) {
+func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
+	serverNames := strings.Split(cfg.Addresses, ",")
 	if cfg.SSL {
 		if cfg.HostVerification {
+			if len(serverNames) > 1 {
+				return errors.New("using multiple hostnames and host verification is unsupported currently")
+			}
 			cluster.SslOpts = &gocql.SslOptions{
 				CaPath:                 cfg.CAPath,
 				EnableHostVerification: true,
 				Config: &tls.Config{
-					ServerName: strings.Split(cfg.Addresses, ",")[0], // TODO
+					ServerName: serverNames[0],
 				},
 			}
 		} else {
@@ -112,6 +118,7 @@ func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) {
 			Password: cfg.Password,
 		}
 	}
+	return nil
 }
 
 // createKeyspace will create the desired keyspace if it doesn't exist.
@@ -122,7 +129,9 @@ func (cfg *Config) createKeyspace() error {
 	cluster.Timeout = 20 * time.Second
 	cluster.ConnectTimeout = 20 * time.Second
 
-	cfg.setClusterConfig(cluster)
+	if err := cfg.setClusterConfig(cluster); err != nil {
+		return errors.WithStack(err)
+	}
 
 	session, err := cluster.CreateSession()
 	if err != nil {
