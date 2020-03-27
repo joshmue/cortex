@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/cortexproject/cortex/pkg/configs"
+	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+
 	"github.com/cortexproject/cortex/pkg/configs/client"
 
-	"github.com/prometheus/prometheus/pkg/rulefmt"
+	legacy_rulefmt "github.com/cortexproject/cortex/pkg/ruler/legacy_rulefmt"
 )
 
 var (
@@ -22,6 +23,10 @@ var (
 // RuleStore is used to store and retrieve rules
 type RuleStore interface {
 	ListAllRuleGroups(ctx context.Context) (map[string]RuleGroupList, error)
+	ListRuleGroups(ctx context.Context, userID string, namespace string) (RuleGroupList, error)
+	GetRuleGroup(ctx context.Context, userID, namespace, group string) (*RuleGroupDesc, error)
+	SetRuleGroup(ctx context.Context, userID, namespace string, group *RuleGroupDesc) error
+	DeleteRuleGroup(ctx context.Context, userID, namespace string, group string) error
 }
 
 // RuleGroupList contains a set of rule groups
@@ -29,11 +34,11 @@ type RuleGroupList []*RuleGroupDesc
 
 // Formatted returns the rule group list as a set of formatted rule groups mapped
 // by namespace
-func (l RuleGroupList) Formatted() map[string][]rulefmt.RuleGroup {
-	ruleMap := map[string][]rulefmt.RuleGroup{}
+func (l RuleGroupList) Formatted() map[string][]legacy_rulefmt.RuleGroup {
+	ruleMap := map[string][]legacy_rulefmt.RuleGroup{}
 	for _, g := range l {
 		if _, exists := ruleMap[g.Namespace]; !exists {
-			ruleMap[g.Namespace] = []rulefmt.RuleGroup{FromProto(g)}
+			ruleMap[g.Namespace] = []legacy_rulefmt.RuleGroup{FromProto(g)}
 			continue
 		}
 		ruleMap[g.Namespace] = append(ruleMap[g.Namespace], FromProto(g))
@@ -45,7 +50,7 @@ func (l RuleGroupList) Formatted() map[string][]rulefmt.RuleGroup {
 // ConfigRuleStore is a concrete implementation of RuleStore that sources rules from the config service
 type ConfigRuleStore struct {
 	configClient  client.Client
-	since         configs.ID
+	since         userconfig.ID
 	ruleGroupList map[string]RuleGroupList
 }
 
@@ -96,7 +101,7 @@ func (c *ConfigRuleStore) ListAllRuleGroups(ctx context.Context) (map[string]Rul
 
 // getLatestConfigID gets the latest configs ID.
 // max [latest, max (map getID cfgs)]
-func getLatestConfigID(cfgs map[string]configs.VersionedRulesConfig, latest configs.ID) configs.ID {
+func getLatestConfigID(cfgs map[string]userconfig.VersionedRulesConfig, latest userconfig.ID) userconfig.ID {
 	ret := latest
 	for _, config := range cfgs {
 		if config.ID > ret {
@@ -104,4 +109,24 @@ func getLatestConfigID(cfgs map[string]configs.VersionedRulesConfig, latest conf
 		}
 	}
 	return ret
+}
+
+// ListRuleGroups is not implemented
+func (c *ConfigRuleStore) ListRuleGroups(ctx context.Context, userID string, namespace string) (RuleGroupList, error) {
+	return nil, errors.New("not implemented by the config service rule store")
+}
+
+// GetRuleGroup is not implemented
+func (c *ConfigRuleStore) GetRuleGroup(ctx context.Context, userID, namespace, group string) (*RuleGroupDesc, error) {
+	return nil, errors.New("not implemented by the config service rule store")
+}
+
+// SetRuleGroup is not implemented
+func (c *ConfigRuleStore) SetRuleGroup(ctx context.Context, userID, namespace string, group *RuleGroupDesc) error {
+	return errors.New("not implemented by the config service rule store")
+}
+
+// DeleteRuleGroup is not implemented
+func (c *ConfigRuleStore) DeleteRuleGroup(ctx context.Context, userID, namespace string, group string) error {
+	return errors.New("not implemented by the config service rule store")
 }

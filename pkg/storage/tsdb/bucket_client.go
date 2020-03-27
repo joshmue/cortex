@@ -6,9 +6,10 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/thanos-io/thanos/pkg/objstore"
 
-	"github.com/cortexproject/cortex/pkg/storage/tsdb/backend/azure"
-	"github.com/cortexproject/cortex/pkg/storage/tsdb/backend/gcs"
-	"github.com/cortexproject/cortex/pkg/storage/tsdb/backend/s3"
+	"github.com/cortexproject/cortex/pkg/storage/backend/azure"
+	"github.com/cortexproject/cortex/pkg/storage/backend/filesystem"
+	"github.com/cortexproject/cortex/pkg/storage/backend/gcs"
+	"github.com/cortexproject/cortex/pkg/storage/backend/s3"
 )
 
 // NewBucketClient creates a new bucket client based on the configured backend
@@ -20,7 +21,9 @@ func NewBucketClient(ctx context.Context, cfg Config, name string, logger log.Lo
 		return gcs.NewBucketClient(ctx, cfg.GCS, name, logger)
 	case BackendAzure:
 		return azure.NewBucketClient(cfg.Azure, name, logger)
+	case BackendFilesystem:
+		return filesystem.NewBucketClient(cfg.Filesystem)
 	default:
-		return nil, errUnsupportedBackend
+		return nil, errUnsupportedStorageBackend
 	}
 }

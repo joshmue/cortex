@@ -16,8 +16,8 @@ RUN curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/in
 RUN GO111MODULE=on go get -tags netgo \
 		github.com/client9/misspell/cmd/misspell@v0.3.4 \
 		github.com/golang/protobuf/protoc-gen-go@v1.3.1 \
-		github.com/gogo/protobuf/protoc-gen-gogoslick@v1.2.1 \
-		github.com/gogo/protobuf/gogoproto@v1.2.1 && \
+		github.com/gogo/protobuf/protoc-gen-gogoslick@v1.3.0 \
+		github.com/gogo/protobuf/gogoproto@v1.3.0 && \
 	rm -rf /go/pkg /go/src
 
 ENV KUBEVAL_VERSION=0.14.0
@@ -30,6 +30,11 @@ ENV NODE_PATH=/usr/lib/node_modules
 COPY build.sh /
 ENV GOCACHE=/go/cache
 ENTRYPOINT ["/build.sh"]
+
+# Install faillint used to lint go imports in CI.
+ENV FAILLINT_VERSION=1.2.0
+RUN GO111MODULE=on go get github.com/fatih/faillint@v${FAILLINT_VERSION} && \
+    rm -rf /go/pkg /go/src
 
 ARG revision
 LABEL org.opencontainers.image.title="build-image" \

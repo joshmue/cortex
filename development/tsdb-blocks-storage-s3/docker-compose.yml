@@ -18,10 +18,21 @@ services:
     volumes:
       - .data-minio:/data:delegated
 
+  memcached:
+    image: memcached:1.6
+
   configstore:
     image: nginx
     volumes:
       - .data-configstore:/usr/share/nginx/html/private:ro
+
+  prometheus:
+    image: prom/prometheus:v2.16.0
+    command: ["--config.file=/etc/prometheus/prometheus.yaml"]
+    volumes:
+      - ./config:/etc/prometheus
+    ports:
+      - 9090:9090
 
   distributor:
     build:
@@ -80,7 +91,21 @@ services:
       - 8004:8004
     volumes:
       - ./config:/cortex/config
-    
+
+  store-gateway:
+    build:
+      context:    .
+      dockerfile: dev.dockerfile
+    image: cortex
+    command: ["sh", "-c", "sleep 3 && exec ./cortex -config.file=./config/cortex.yaml -target=store-gateway -server.http-listen-port=8008 -server.grpc-listen-port=9008"]
+    depends_on:
+      - consul
+      - minio
+    ports:
+      - 8008:8008
+    volumes:
+      - ./config:/cortex/config
+
   ruler:
     build:
       context:    .
@@ -92,5 +117,33 @@ services:
       - minio
     ports:
       - 8005:8005
+    volumes:
+      - ./config:/cortex/config
+
+  compactor:
+    build:
+      context:    .
+      dockerfile: dev.dockerfile
+    image: cortex
+    command: ["sh", "-c", "sleep 3 && exec ./cortex -config.file=./config/cortex.yaml -target=compactor -server.http-listen-port=8006 -server.grpc-listen-port=9006"]
+    depends_on:
+      - consul
+      - minio
+    ports:
+      - 8006:8006
+    volumes:
+      - ./config:/cortex/config
+
+  query-frontend:
+    build:
+      context:    .
+      dockerfile: dev.dockerfile
+    image: cortex
+    command: ["sh", "-c", "sleep 3 && exec ./cortex -config.file=./config/cortex.yaml -target=query-frontend -server.http-listen-port=8007 -server.grpc-listen-port=9007"]
+    depends_on:
+      - consul
+      - minio
+    ports:
+      - 8007:8007
     volumes:
       - ./config:/cortex/config

@@ -1,13 +1,20 @@
 package cortex
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+
+	"github.com/cortexproject/cortex/pkg/configs"
+	"github.com/cortexproject/cortex/pkg/storegateway"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
+	prom_storage "github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/server"
 	"google.golang.org/grpc"
@@ -17,23 +24,26 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/chunk/purger"
 	"github.com/cortexproject/cortex/pkg/chunk/storage"
 	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
 	"github.com/cortexproject/cortex/pkg/compactor"
 	"github.com/cortexproject/cortex/pkg/configs/api"
-	config_client "github.com/cortexproject/cortex/pkg/configs/client"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/distributor"
+	"github.com/cortexproject/cortex/pkg/flusher"
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
@@ -56,34 +66,37 @@ import (
 
 // Config is the root config for Cortex.
 type Config struct {
-	Target      moduleName `yaml:"target,omitempty"`
-	AuthEnabled bool       `yaml:"auth_enabled,omitempty"`
+	Target      ModuleName `yaml:"target"`
+	AuthEnabled bool       `yaml:"auth_enabled"`
 	PrintConfig bool       `yaml:"-"`
 	HTTPPrefix  string     `yaml:"http_prefix"`
 
-	Server         server.Config            `yaml:"server,omitempty"`
-	Distributor    distributor.Config       `yaml:"distributor,omitempty"`
-	Querier        querier.Config           `yaml:"querier,omitempty"`
-	IngesterClient client.Config            `yaml:"ingester_client,omitempty"`
-	Ingester       ingester.Config          `yaml:"ingester,omitempty"`
-	Storage        storage.Config           `yaml:"storage,omitempty"`
-	ChunkStore     chunk.StoreConfig        `yaml:"chunk_store,omitempty"`
-	Schema         chunk.SchemaConfig       `yaml:"schema,omitempty" doc:"hidden"` // Doc generation tool doesn't support it because part of the SchemaConfig doesn't support CLI flags (needs manual documentation)
-	LimitsConfig   validation.Limits        `yaml:"limits,omitempty"`
-	Prealloc       client.PreallocConfig    `yaml:"prealloc,omitempty" doc:"hidden"`
-	Worker         frontend.WorkerConfig    `yaml:"frontend_worker,omitempty"`
-	Frontend       frontend.Config          `yaml:"frontend,omitempty"`
-	QueryRange     queryrange.Config        `yaml:"query_range,omitempty"`
-	TableManager   chunk.TableManagerConfig `yaml:"table_manager,omitempty"`
-	Encoding       encoding.Config          `yaml:"-"` // No yaml for this, it only works with flags.
-	TSDB           tsdb.Config              `yaml:"tsdb" doc:"hidden"`
-	Compactor      compactor.Config         `yaml:"compactor,omitempty" doc:"hidden"`
+	Server           server.Config            `yaml:"server"`
+	Distributor      distributor.Config       `yaml:"distributor"`
+	Querier          querier.Config           `yaml:"querier"`
+	IngesterClient   client.Config            `yaml:"ingester_client"`
+	Ingester         ingester.Config          `yaml:"ingester"`
+	Flusher          flusher.Config           `yaml:"flusher"`
+	Storage          storage.Config           `yaml:"storage"`
+	ChunkStore       chunk.StoreConfig        `yaml:"chunk_store"`
+	Schema           chunk.SchemaConfig       `yaml:"schema" doc:"hidden"` // Doc generation tool doesn't support it because part of the SchemaConfig doesn't support CLI flags (needs manual documentation)
+	LimitsConfig     validation.Limits        `yaml:"limits"`
+	Prealloc         client.PreallocConfig    `yaml:"prealloc" doc:"hidden"`
+	Worker           frontend.WorkerConfig    `yaml:"frontend_worker"`
+	Frontend         frontend.Config          `yaml:"frontend"`
+	QueryRange       queryrange.Config        `yaml:"query_range"`
+	TableManager     chunk.TableManagerConfig `yaml:"table_manager"`
+	Encoding         encoding.Config          `yaml:"-"` // No yaml for this, it only works with flags.
+	TSDB             tsdb.Config              `yaml:"tsdb"`
+	Compactor        compactor.Config         `yaml:"compactor"`
+	StoreGateway     storegateway.Config      `yaml:"store_gateway"`
+	DataPurgerConfig purger.Config            `yaml:"purger"`
 
-	Ruler         ruler.Config                               `yaml:"ruler,omitempty"`
-	ConfigDB      db.Config                                  `yaml:"configdb,omitempty"`
-	ConfigStore   config_client.Config                       `yaml:"config_store,omitempty"`
-	Alertmanager  alertmanager.MultitenantAlertmanagerConfig `yaml:"alertmanager,omitempty"`
-	RuntimeConfig runtimeconfig.ManagerConfig                `yaml:"runtime_config,omitempty"`
+	Ruler         ruler.Config                               `yaml:"ruler"`
+	Configs       configs.Config                             `yaml:"configs"`
+	Alertmanager  alertmanager.MultitenantAlertmanagerConfig `yaml:"alertmanager"`
+	RuntimeConfig runtimeconfig.ManagerConfig                `yaml:"runtime_config"`
+	MemberlistKV  memberlist.KVConfig                        `yaml:"memberlist"`
 }
 
 // RegisterFlags registers flag.
@@ -101,6 +114,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Querier.RegisterFlags(f)
 	c.IngesterClient.RegisterFlags(f)
 	c.Ingester.RegisterFlags(f)
+	c.Flusher.RegisterFlags(f)
 	c.Storage.RegisterFlags(f)
 	c.ChunkStore.RegisterFlags(f)
 	c.Schema.RegisterFlags(f)
@@ -113,12 +127,14 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Encoding.RegisterFlags(f)
 	c.TSDB.RegisterFlags(f)
 	c.Compactor.RegisterFlags(f)
+	c.StoreGateway.RegisterFlags(f)
+	c.DataPurgerConfig.RegisterFlags(f)
 
 	c.Ruler.RegisterFlags(f)
-	c.ConfigDB.RegisterFlags(f)
-	c.ConfigStore.RegisterFlagsWithPrefix("alertmanager.", f)
+	c.Configs.RegisterFlags(f)
 	c.Alertmanager.RegisterFlags(f)
 	c.RuntimeConfig.RegisterFlags(f)
+	c.MemberlistKV.RegisterFlags(f, "")
 
 	// These don't seem to have a home.
 	flag.IntVar(&chunk_util.QueryParallelism, "querier.query-parallelism", 100, "Max subqueries run in parallel per higher-level query.")
@@ -151,35 +167,45 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.QueryRange.Validate(log); err != nil {
 		return errors.Wrap(err, "invalid queryrange config")
 	}
+	if err := c.TableManager.Validate(); err != nil {
+		return errors.Wrap(err, "invalid tablemanager config")
+	}
 	return nil
 }
 
 // Cortex is the root datastructure for Cortex.
 type Cortex struct {
-	target             moduleName
+	target             ModuleName
 	httpAuthMiddleware middleware.Interface
+
+	// set during initialization
+	serviceMap map[ModuleName]services.Service
 
 	server        *server.Server
 	ring          *ring.Ring
 	overrides     *validation.Overrides
 	distributor   *distributor.Distributor
 	ingester      *ingester.Ingester
+	flusher       *flusher.Flusher
 	store         chunk.Store
-	worker        frontend.Worker
+	deletesStore  *purger.DeleteStore
 	frontend      *frontend.Frontend
 	tableManager  *chunk.TableManager
 	cache         cache.Cache
 	runtimeConfig *runtimeconfig.Manager
+	dataPurger    *purger.DataPurger
 
 	ruler        *ruler.Ruler
 	configAPI    *api.API
 	configDB     db.DB
 	alertmanager *alertmanager.MultitenantAlertmanager
 	compactor    *compactor.Compactor
+	storeGateway *storegateway.StoreGateway
+	memberlistKV *memberlist.KVInit
 
-	// The chunk store that the querier should use to query the long
+	// Queryable that the querier should use to query the long
 	// term storage. It depends on the storage engine used.
-	querierChunkStore querier.ChunkStore
+	storeQueryable prom_storage.Queryable
 }
 
 // New makes a new Cortex.
@@ -197,10 +223,13 @@ func New(cfg Config) (*Cortex, error) {
 
 	cortex.setupAuthMiddleware(&cfg)
 
-	if err := cortex.init(&cfg, cfg.Target); err != nil {
+	serviceMap, err := cortex.initModuleServices(&cfg, cfg.Target)
+	if err != nil {
 		return nil, err
 	}
 
+	cortex.serviceMap = serviceMap
+	cortex.server.HTTP.Handle("/services", http.HandlerFunc(cortex.servicesHandler))
 	return cortex, nil
 }
 
@@ -236,54 +265,152 @@ func (t *Cortex) setupAuthMiddleware(cfg *Config) {
 	}
 }
 
-func (t *Cortex) init(cfg *Config, m moduleName) error {
+func (t *Cortex) initModuleServices(cfg *Config, target ModuleName) (map[ModuleName]services.Service, error) {
+	servicesMap := map[ModuleName]services.Service{}
+
 	// initialize all of our dependencies first
-	for _, dep := range orderedDeps(m) {
-		if err := t.initModule(cfg, dep); err != nil {
-			return err
+	deps := orderedDeps(target)
+	deps = append(deps, target) // lastly, initialize the requested module
+
+	for ix, n := range deps {
+		mod := modules[n]
+
+		var serv services.Service
+
+		if mod.service != nil {
+			s, err := mod.service(t, cfg)
+			if err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("error initialising module: %s", n))
+			}
+			serv = s
+		} else if mod.wrappedService != nil {
+			s, err := mod.wrappedService(t, cfg)
+			if err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("error initialising module: %s", n))
+			}
+			if s != nil {
+				// We pass servicesMap, which isn't yet finished. By the time service starts,
+				// it will be fully built, so there is no need for extra synchronization.
+				serv = newModuleServiceWrapper(servicesMap, n, s, mod.deps, findInverseDependencies(n, deps[ix+1:]))
+			}
+		}
+
+		if serv != nil {
+			servicesMap[n] = serv
 		}
 	}
-	// lastly, initialize the requested module
-	return t.initModule(cfg, m)
+
+	return servicesMap, nil
 }
 
-func (t *Cortex) initModule(cfg *Config, m moduleName) error {
-	level.Info(util.Logger).Log("msg", "initialising", "module", m)
-	if modules[m].init != nil {
-		if err := modules[m].init(t, cfg); err != nil {
-			return errors.Wrap(err, fmt.Sprintf("error initialising module: %s", m))
-		}
-	}
-	return nil
-}
-
-// Run starts Cortex running, and blocks until a signal is received.
+// Run starts Cortex running, and blocks until a Cortex stops.
 func (t *Cortex) Run() error {
-	return t.server.Run()
-}
-
-// Stop gracefully stops a Cortex.
-func (t *Cortex) Stop() error {
-	t.stopModule(t.target)
-	deps := orderedDeps(t.target)
-	// iterate over our deps in reverse order and call stopModule
-	for i := len(deps) - 1; i >= 0; i-- {
-		t.stopModule(deps[i])
+	// get all services, create service manager and tell it to start
+	servs := []services.Service(nil)
+	for _, s := range t.serviceMap {
+		servs = append(servs, s)
 	}
-	return nil
+
+	sm, err := services.NewManager(servs...)
+	if err != nil {
+		return err
+	}
+
+	// before starting servers, register /ready handler. It should reflect entire Cortex.
+	t.server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
+
+	// Let's listen for events from this manager, and log them.
+	healthy := func() { level.Info(util.Logger).Log("msg", "Cortex started") }
+	stopped := func() { level.Info(util.Logger).Log("msg", "Cortex stopped") }
+	serviceFailed := func(service services.Service) {
+		// if any service fails, stop entire Cortex
+		sm.StopAsync()
+
+		// let's find out which module failed
+		for m, s := range t.serviceMap {
+			if s == service {
+				if service.FailureCase() == util.ErrStopProcess {
+					level.Info(util.Logger).Log("msg", "received stop signal via return error", "module", m, "error", service.FailureCase())
+				} else {
+					level.Error(util.Logger).Log("msg", "module failed", "module", m, "error", service.FailureCase())
+				}
+				return
+			}
+		}
+
+		level.Error(util.Logger).Log("msg", "module failed", "module", "unknown", "error", service.FailureCase())
+	}
+
+	sm.AddListener(services.NewManagerListener(healthy, stopped, serviceFailed))
+
+	// Currently it's the Server that reacts on signal handler,
+	// so get Server service, and wait until it gets to Stopping state.
+	// It will also be stopped via service manager if any service fails (see attached service listener)
+	// Attach listener before starting services, or we may miss the notification.
+	serverStopping := make(chan struct{})
+	t.serviceMap[Server].AddListener(services.NewListener(nil, nil, func(from services.State) {
+		close(serverStopping)
+	}, nil, nil))
+
+	// Start all services. This can really only fail if some service is already
+	// in other state than New, which should not be the case.
+	err = sm.StartAsync(context.Background())
+	if err == nil {
+		// no error starting the services, now let's just wait until Server module
+		// transitions to Stopping (after SIGTERM or when some service fails),
+		// and then initiate shutdown
+		<-serverStopping
+	}
+
+	// Stop all the services, and wait until they are all done.
+	// We don't care about this error, as it cannot really fail.
+	_ = services.StopManagerAndAwaitStopped(context.Background(), sm)
+
+	// if any service failed, report that as an error to caller
+	if err == nil {
+		if failed := sm.ServicesByState()[services.Failed]; len(failed) > 0 {
+			for _, f := range failed {
+				if f.FailureCase() != util.ErrStopProcess {
+					// Details were reported via failure listener before
+					err = errors.New("failed services")
+					break
+				}
+			}
+		}
+	}
+	return err
 }
 
-func (t *Cortex) stopModule(m moduleName) {
-	level.Info(util.Logger).Log("msg", "stopping", "module", m)
-	if modules[m].stop != nil {
-		if err := modules[m].stop(t); err != nil {
-			level.Error(util.Logger).Log("msg", "error stopping", "module", m, "err", err)
+func (t *Cortex) readyHandler(sm *services.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !sm.IsHealthy() {
+			msg := bytes.Buffer{}
+			msg.WriteString("Some services are not Running:\n")
+
+			byState := sm.ServicesByState()
+			for st, ls := range byState {
+				msg.WriteString(fmt.Sprintf("%v: %d\n", st, len(ls)))
+			}
+
+			http.Error(w, msg.String(), http.StatusServiceUnavailable)
+			return
 		}
+
+		// Ingester has a special check that makes sure that it was able to register into the ring,
+		// and that all other ring entries are OK too.
+		if t.ingester != nil {
+			if err := t.ingester.CheckReady(r.Context()); err != nil {
+				http.Error(w, "Ingester not ready: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+		}
+
+		http.Error(w, "ready", http.StatusOK)
 	}
 }
 
 // listDeps recursively gets a list of dependencies for a passed moduleName
-func listDeps(m moduleName) []moduleName {
+func listDeps(m ModuleName) []ModuleName {
 	deps := modules[m].deps
 	for _, d := range modules[m].deps {
 		deps = append(deps, listDeps(d)...)
@@ -292,16 +419,16 @@ func listDeps(m moduleName) []moduleName {
 }
 
 // orderedDeps gets a list of all dependencies ordered so that items are always after any of their dependencies.
-func orderedDeps(m moduleName) []moduleName {
+func orderedDeps(m ModuleName) []ModuleName {
 	deps := listDeps(m)
 
 	// get a unique list of moduleNames, with a flag for whether they have been added to our result
-	uniq := map[moduleName]bool{}
+	uniq := map[ModuleName]bool{}
 	for _, dep := range deps {
 		uniq[dep] = false
 	}
 
-	result := make([]moduleName, 0, len(uniq))
+	result := make([]ModuleName, 0, len(uniq))
 
 	// keep looping through all modules until they have all been added to the result.
 
@@ -325,5 +452,21 @@ func orderedDeps(m moduleName) []moduleName {
 			result = append(result, name)
 		}
 	}
+	return result
+}
+
+// find modules in the supplied list, that depend on mod
+func findInverseDependencies(mod ModuleName, mods []ModuleName) []ModuleName {
+	result := []ModuleName(nil)
+
+	for _, n := range mods {
+		for _, d := range modules[n].deps {
+			if d == mod {
+				result = append(result, n)
+				break
+			}
+		}
+	}
+
 	return result
 }

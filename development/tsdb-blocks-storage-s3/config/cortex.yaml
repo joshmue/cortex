@@ -39,6 +39,11 @@ tsdb:
   bucket_store:
     sync_dir: /tmp/cortex-tsdb-querier
 
+    index_cache:
+      backend: memcached
+      memcached:
+        addresses: dns+memcached:11211
+
   s3:
     endpoint:          minio:9000
     bucket_name:       cortex-tsdb
@@ -51,7 +56,21 @@ ruler:
   storeconfig:
     type: configdb
     configdb:
-      configsapiurl: http://configstore:80/
+      configs_api_url: http://configstore:80/
 
 storage:
   engine: tsdb
+
+compactor:
+  compaction_interval: 30s
+  data_dir:            /tmp/cortex-compactor
+  consistency_delay:   1m
+  sharding_enabled:    true
+  sharding_ring:
+    kvstore:
+      store: consul
+      consul:
+        host: consul:8500
+
+frontend_worker:
+  address: "query-frontend:9007"

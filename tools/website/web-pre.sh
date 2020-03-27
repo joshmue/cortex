@@ -14,17 +14,17 @@ mkdir -p ${OUTPUT_CONTENT_DIR}
 
 # Copy original content.
 cp -r ${ORIGINAL_CONTENT_DIR}/* ${OUTPUT_CONTENT_DIR}
-cp -r CONTRIBUTING.md code-of-conduct.md CHANGELOG.md ${OUTPUT_CONTENT_DIR}
+cp -r code-of-conduct.md CHANGELOG.md ${OUTPUT_CONTENT_DIR}
+cp GOVERNANCE.md ${OUTPUT_CONTENT_DIR}/governance/_index.md
 cp images/* ${WEBSITE_DIR}/static/images
 
-# Add headers to special CODE_OF_CONDUCT.md, CONTRIBUTING.md and CHANGELOG.md files.
+# Add headers to special CODE_OF_CONDUCT.md and CHANGELOG.md files.
 echo "$(cat <<EOT
 ---
 title: Code of Conduct
 type: docs
-menu:
-  contributing:
-    weight: 1
+originalpath: code-of-conduct.md
+weight: 13
 ---
 EOT
 )" > ${OUTPUT_CONTENT_DIR}/code-of-conduct.md
@@ -34,9 +34,8 @@ echo "$(cat <<EOT
 ---
 title: Changelog
 type: docs
-menu:
-  main:
-    weight: 2
+originalpath: CHANGELOG.md
+weight: 12
 ---
 EOT
 )" > ${OUTPUT_CONTENT_DIR}/CHANGELOG.md
@@ -44,15 +43,14 @@ tail -n +2 CHANGELOG.md >> ${OUTPUT_CONTENT_DIR}/CHANGELOG.md
 
 echo "$(cat <<EOT
 ---
-title: Contributing
+title: Governance
 type: docs
-menu:
-  contributing:
-    weight: 3
+originalpath: GOVERNANCE.md
+weight: 11
 ---
 EOT
-)" > ${OUTPUT_CONTENT_DIR}/CONTRIBUTING.md
-tail -n +2 CONTRIBUTING.md >> ${OUTPUT_CONTENT_DIR}/CONTRIBUTING.md
+)" > ${OUTPUT_CONTENT_DIR}/governance/_index.md
+tail -n +2 GOVERNANCE.md >> ${OUTPUT_CONTENT_DIR}/governance/_index.md
 
 ALL_DOC_CONTENT_FILES=`echo "${OUTPUT_CONTENT_DIR}/**/*.md ${OUTPUT_CONTENT_DIR}/*.md"`
 for file in $(find ${OUTPUT_CONTENT_DIR} -name '*.md')

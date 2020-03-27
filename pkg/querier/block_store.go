@@ -2,9 +2,7 @@ package querier
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"net"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,41 +10,41 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/logging"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
 // UserStore is a multi-tenant version of Thanos BucketStore
 type UserStore struct {
-	logger      log.Logger
-	cfg         tsdb.Config
-	bucket      objstore.Bucket
-	client      storepb.StoreClient
-	logLevel    logging.Level
-	tsdbMetrics *tsdbBucketStoreMetrics
+	services.Service
 
-	syncMint model.TimeOrDurationValue
-	syncMaxt model.TimeOrDurationValue
+	logger             log.Logger
+	cfg                tsdb.Config
+	bucket             objstore.Bucket
+	logLevel           logging.Level
+	bucketStoreMetrics *tsdbBucketStoreMetrics
+	indexCacheMetrics  prometheus.Collector
+
+	// Index cache shared across all tenants.
+	indexCache storecache.IndexCache
 
 	// Keeps a bucket store for each tenant.
 	storesMu sync.RWMutex
 	stores   map[string]*store.BucketStore
-
-	// Used to cancel workers and wait until done.
-	workers       sync.WaitGroup
-	workersCancel context.CancelFunc
 
 	// Metrics.
 	syncTimes prometheus.Histogram
@@ -54,70 +52,46 @@ type UserStore struct {
 
 // NewUserStore returns a new UserStore
 func NewUserStore(cfg tsdb.Config, bucketClient objstore.Bucket, logLevel logging.Level, logger log.Logger, registerer prometheus.Registerer) (*UserStore, error) {
-	workersCtx, workersCancel := context.WithCancel(context.Background())
+	indexCacheRegistry := prometheus.NewRegistry()
 
 	u := &UserStore{
-		logger:        logger,
-		cfg:           cfg,
-		bucket:        bucketClient,
-		stores:        map[string]*store.BucketStore{},
-		logLevel:      logLevel,
-		tsdbMetrics:   newTSDBBucketStoreMetrics(),
-		workersCancel: workersCancel,
-		syncTimes: prometheus.NewHistogram(prometheus.HistogramOpts{
+		logger:             logger,
+		cfg:                cfg,
+		bucket:             bucketClient,
+		stores:             map[string]*store.BucketStore{},
+		logLevel:           logLevel,
+		bucketStoreMetrics: newTSDBBucketStoreMetrics(),
+		indexCacheMetrics:  tsdb.MustNewIndexCacheMetrics(cfg.BucketStore.IndexCache.Backend, indexCacheRegistry),
+		syncTimes: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
 			Name:    "cortex_querier_blocks_sync_seconds",
 			Help:    "The total time it takes to perform a sync stores",
 			Buckets: []float64{0.1, 1, 10, 30, 60, 120, 300, 600, 900},
 		}),
 	}
 
-	// Configure the time range to sync all blocks.
-	if err := u.syncMint.Set("0000-01-01T00:00:00Z"); err != nil {
-		return nil, err
-	}
-	if err := u.syncMaxt.Set("9999-12-31T23:59:59Z"); err != nil {
-		return nil, err
+	// Init the index cache.
+	var err error
+	if u.indexCache, err = tsdb.NewIndexCache(cfg.BucketStore.IndexCache, logger, indexCacheRegistry); err != nil {
+		return nil, errors.Wrap(err, "create index cache")
 	}
 
 	if registerer != nil {
-		registerer.MustRegister(u.syncTimes, u.tsdbMetrics)
+		registerer.MustRegister(u.bucketStoreMetrics, u.indexCacheMetrics)
 	}
 
-	serv := grpc.NewServer()
-	storepb.RegisterStoreServer(serv, u)
-	l, err := net.Listen("tcp", "")
-	if err != nil {
-		return nil, err
-	}
-	go serv.Serve(l)
-
-	cc, err := grpc.Dial(l.Addr().String(), grpc.WithInsecure())
-	if err != nil {
-		return nil, err
-	}
-
-	u.client = storepb.NewStoreClient(cc)
-
-	// If the sync is disabled we never sync blocks, which means the bucket store
-	// will be empty and no series will be returned once queried.
-	if u.cfg.BucketStore.SyncInterval > 0 {
-		// Run an initial blocks sync, required in order to be able to serve queries.
-		if err := u.initialSync(workersCtx); err != nil {
-			return nil, err
-		}
-
-		// Periodically sync the blocks.
-		u.workers.Add(1)
-		go u.syncStoresLoop(workersCtx)
-	}
-
+	u.Service = services.NewBasicService(u.starting, u.syncStoresLoop, nil)
 	return u, nil
 }
 
-// Stop the blocks sync and waits until done.
-func (u *UserStore) Stop() {
-	u.workersCancel()
-	u.workers.Wait()
+func (u *UserStore) starting(ctx context.Context) error {
+	if u.cfg.BucketStore.SyncInterval > 0 {
+		// Run an initial blocks sync, required in order to be able to serve queries.
+		if err := u.initialSync(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // initialSync iterates over the storage bucket creating user bucket stores, and calling initialSync on each of them
@@ -136,8 +110,13 @@ func (u *UserStore) initialSync(ctx context.Context) error {
 }
 
 // syncStoresLoop periodically calls syncStores() to synchronize the blocks for all tenants.
-func (u *UserStore) syncStoresLoop(ctx context.Context) {
-	defer u.workers.Done()
+func (u *UserStore) syncStoresLoop(ctx context.Context) error {
+	// If the sync is disabled we never sync blocks, which means the bucket store
+	// will be empty and no series will be returned once queried.
+	if u.cfg.BucketStore.SyncInterval <= 0 {
+		<-ctx.Done()
+		return nil
+	}
 
 	syncInterval := u.cfg.BucketStore.SyncInterval
 
@@ -145,7 +124,7 @@ func (u *UserStore) syncStoresLoop(ctx context.Context) {
 	// sync interval before resynching.
 	select {
 	case <-ctx.Done():
-		return
+		return nil
 	case <-time.After(syncInterval):
 	}
 
@@ -160,12 +139,10 @@ func (u *UserStore) syncStoresLoop(ctx context.Context) {
 		return nil
 	})
 
-	if err != nil {
-		// This should never occur because the rununtil.Repeat() returns error
-		// only if the callback function returns error (which doesn't), but since
-		// we have to handle the error because of the linter, it's better to log it.
-		level.Error(u.logger).Log("msg", "blocks synchronization has been halted due to an unexpected error", "err", err)
-	}
+	// This should never occur because the rununtil.Repeat() returns error
+	// only if the callback function returns error (which doesn't), but since
+	// we have to handle the error because of the linter, it's better to log it.
+	return errors.Wrap(err, "blocks synchronization has been halted due to an unexpected error")
 }
 
 // syncStores iterates over the storage bucket creating user bucket stores
@@ -233,96 +210,23 @@ func (u *UserStore) syncUserStores(ctx context.Context, f func(context.Context, 
 	return err
 }
 
-// Info makes an info request to the underlying user store
-func (u *UserStore) Info(ctx context.Context, req *storepb.InfoRequest) (*storepb.InfoResponse, error) {
-	log, ctx := spanlogger.New(ctx, "UserStore.Info")
+// Series makes a series request to the underlying user store.
+func (u *UserStore) Series(ctx context.Context, userID string, req *storepb.SeriesRequest) ([]*storepb.Series, storage.Warnings, error) {
+	log, ctx := spanlogger.New(ctx, "UserStore.Series")
 	defer log.Span.Finish()
 
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, fmt.Errorf("no metadata")
-	}
-
-	v := md.Get("user")
-	if len(v) == 0 {
-		return nil, fmt.Errorf("no userID")
-	}
-
-	store := u.getStore(v[0])
+	store := u.getStore(userID)
 	if store == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	return store.Info(ctx, req)
-}
-
-// Series makes a series request to the underlying user store
-func (u *UserStore) Series(req *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
-	log, ctx := spanlogger.New(srv.Context(), "UserStore.Series")
-	defer log.Span.Finish()
-
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return fmt.Errorf("no metadata")
+	srv := newBucketStoreSeriesServer(ctx)
+	err := store.Series(req, srv)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	v := md.Get("user")
-	if len(v) == 0 {
-		return fmt.Errorf("no userID")
-	}
-
-	store := u.getStore(v[0])
-	if store == nil {
-		return nil
-	}
-
-	return store.Series(req, srv)
-}
-
-// LabelNames makes a labelnames request to the underlying user store
-func (u *UserStore) LabelNames(ctx context.Context, req *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	log, ctx := spanlogger.New(ctx, "UserStore.LabelNames")
-	defer log.Span.Finish()
-
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, fmt.Errorf("no metadata")
-	}
-
-	v := md.Get("user")
-	if len(v) == 0 {
-		return nil, fmt.Errorf("no userID")
-	}
-
-	store := u.getStore(v[0])
-	if store == nil {
-		return nil, nil
-	}
-
-	return store.LabelNames(ctx, req)
-}
-
-// LabelValues makes a labelvalues request to the underlying user store
-func (u *UserStore) LabelValues(ctx context.Context, req *storepb.LabelValuesRequest) (*storepb.LabelValuesResponse, error) {
-	log, ctx := spanlogger.New(ctx, "UserStore.LabelValues")
-	defer log.Span.Finish()
-
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, fmt.Errorf("no metadata")
-	}
-
-	v := md.Get("user")
-	if len(v) == 0 {
-		return nil, fmt.Errorf("no userID")
-	}
-
-	store := u.getStore(v[0])
-	if store == nil {
-		return nil, nil
-	}
-
-	return store.LabelValues(ctx, req)
+	return srv.SeriesSet, srv.Warnings, nil
 }
 
 func (u *UserStore) getStore(userID string) *store.BucketStore {
@@ -349,57 +253,51 @@ func (u *UserStore) getOrCreateStore(userID string) (*store.BucketStore, error) 
 		return bs, nil
 	}
 
-	level.Info(u.logger).Log("msg", "creating user bucket store", "user", userID)
+	userLogger := util.WithUserID(userID, u.logger)
+
+	level.Info(userLogger).Log("msg", "creating user bucket store")
 
 	userBkt := tsdb.NewUserBucketClient(userID, u.bucket)
 
 	reg := prometheus.NewRegistry()
-	indexCacheSizeBytes := u.cfg.BucketStore.IndexCacheSizeBytes
-	maxItemSizeBytes := indexCacheSizeBytes / 2
-	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(u.logger, reg, storecache.InMemoryIndexCacheConfig{
-		MaxSize:     storecache.Bytes(indexCacheSizeBytes),
-		MaxItemSize: storecache.Bytes(maxItemSizeBytes),
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	fetcher, err := block.NewMetaFetcher(
-		u.logger,
+		userLogger,
 		u.cfg.BucketStore.MetaSyncConcurrency,
 		userBkt,
 		filepath.Join(u.cfg.BucketStore.SyncDir, userID), // The fetcher stores cached metas in the "meta-syncer/" sub directory
 		reg,
-		// No filters
+		// List of filters to apply (order matters).
+		block.NewConsistencyDelayMetaFilter(userLogger, u.cfg.BucketStore.ConsistencyDelay, reg).Filter,
+		// Filters out duplicate blocks that can be formed from two or more overlapping
+		// blocks that fully submatches the source blocks of the older blocks.
+		block.NewDeduplicateFilter().Filter,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	bs, err = store.NewBucketStore(
-		u.logger,
+		userLogger,
 		reg,
 		userBkt,
 		fetcher,
 		filepath.Join(u.cfg.BucketStore.SyncDir, userID),
-		indexCache,
+		u.indexCache,
 		uint64(u.cfg.BucketStore.MaxChunkPoolBytes),
 		u.cfg.BucketStore.MaxSampleCount,
 		u.cfg.BucketStore.MaxConcurrent,
 		u.logLevel.String() == "debug", // Turn on debug logging, if the log level is set to debug
 		u.cfg.BucketStore.BlockSyncConcurrency,
-		&store.FilterConfig{
-			MinTime: u.syncMint,
-			MaxTime: u.syncMaxt,
-		},
+		nil,   // Do not limit timerange.
 		false, // No need to enable backward compatibility with Thanos pre 0.8.0 queriers
+		u.cfg.BucketStore.BinaryIndexHeader,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	u.stores[userID] = bs
-	u.tsdbMetrics.addUserRegistry(userID, reg)
+	u.bucketStoreMetrics.addUserRegistry(userID, reg)
 
 	return bs, nil
 }

@@ -4,7 +4,6 @@
 package rules
 
 import (
-	encoding_binary "encoding/binary"
 	fmt "fmt"
 	_ "github.com/cortexproject/cortex/pkg/ingester/client"
 	github_com_cortexproject_cortex_pkg_ingester_client "github.com/cortexproject/cortex/pkg/ingester/client"
@@ -12,9 +11,9 @@ import (
 	proto "github.com/gogo/protobuf/proto"
 	github_com_gogo_protobuf_types "github.com/gogo/protobuf/types"
 	_ "github.com/golang/protobuf/ptypes/duration"
-	_ "github.com/golang/protobuf/ptypes/timestamp"
 	io "io"
 	math "math"
+	math_bits "math/bits"
 	reflect "reflect"
 	strings "strings"
 	time "time"
@@ -30,7 +29,7 @@ var _ = time.Kitchen
 // is compatible with the proto package it is being compiled against.
 // A compilation error at this line likely means your copy of the
 // proto package needs to be updated.
-const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
+const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 
 // RuleGroupDesc is a proto representation of a cortex rule group
 type RuleGroupDesc struct {
@@ -38,7 +37,6 @@ type RuleGroupDesc struct {
 	Namespace string        `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	Interval  time.Duration `protobuf:"bytes,3,opt,name=interval,proto3,stdduration" json:"interval"`
 	Rules     []*RuleDesc   `protobuf:"bytes,4,rep,name=rules,proto3" json:"rules,omitempty"`
-	Deleted   bool          `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
 	User      string        `protobuf:"bytes,6,opt,name=user,proto3" json:"user,omitempty"`
 }
 
@@ -55,7 +53,7 @@ func (m *RuleGroupDesc) XXX_Marshal(b []byte, deterministic bool) ([]byte, error
 		return xxx_messageInfo_RuleGroupDesc.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
-		n, err := m.MarshalTo(b)
+		n, err := m.MarshalToSizedBuffer(b)
 		if err != nil {
 			return nil, err
 		}
@@ -102,13 +100,6 @@ func (m *RuleGroupDesc) GetRules() []*RuleDesc {
 	return nil
 }
 
-func (m *RuleGroupDesc) GetDeleted() bool {
-	if m != nil {
-		return m.Deleted
-	}
-	return false
-}
-
 func (m *RuleGroupDesc) GetUser() string {
 	if m != nil {
 		return m.User
@@ -124,10 +115,6 @@ type RuleDesc struct {
 	For         time.Duration                                                      `protobuf:"bytes,4,opt,name=for,proto3,stdduration" json:"for"`
 	Labels      []github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter `protobuf:"bytes,5,rep,name=labels,proto3,customtype=github.com/cortexproject/cortex/pkg/ingester/client.LabelAdapter" json:"labels"`
 	Annotations []github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter `protobuf:"bytes,6,rep,name=annotations,proto3,customtype=github.com/cortexproject/cortex/pkg/ingester/client.LabelAdapter" json:"annotations"`
-	State       string                                                             `protobuf:"bytes,7,opt,name=state,proto3" json:"state,omitempty"`
-	Health      string                                                             `protobuf:"bytes,8,opt,name=health,proto3" json:"health,omitempty"`
-	LastError   string                                                             `protobuf:"bytes,9,opt,name=lastError,proto3" json:"lastError,omitempty"`
-	Alerts      []*AlertDesc                                                       `protobuf:"bytes,10,rep,name=alerts,proto3" json:"alerts,omitempty"`
 }
 
 func (m *RuleDesc) Reset()      { *m = RuleDesc{} }
@@ -143,7 +130,7 @@ func (m *RuleDesc) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return xxx_messageInfo_RuleDesc.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
-		n, err := m.MarshalTo(b)
+		n, err := m.MarshalToSizedBuffer(b)
 		if err != nil {
 			return nil, err
 		}
@@ -190,178 +177,44 @@ func (m *RuleDesc) GetFor() time.Duration {
 	return 0
 }
 
-func (m *RuleDesc) GetState() string {
-	if m != nil {
-		return m.State
-	}
-	return ""
-}
-
-func (m *RuleDesc) GetHealth() string {
-	if m != nil {
-		return m.Health
-	}
-	return ""
-}
-
-func (m *RuleDesc) GetLastError() string {
-	if m != nil {
-		return m.LastError
-	}
-	return ""
-}
-
-func (m *RuleDesc) GetAlerts() []*AlertDesc {
-	if m != nil {
-		return m.Alerts
-	}
-	return nil
-}
-
-type AlertDesc struct {
-	State       string                                                             `protobuf:"bytes,1,opt,name=state,proto3" json:"state,omitempty"`
-	Labels      []github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter `protobuf:"bytes,2,rep,name=labels,proto3,customtype=github.com/cortexproject/cortex/pkg/ingester/client.LabelAdapter" json:"labels"`
-	Annotations []github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter `protobuf:"bytes,3,rep,name=annotations,proto3,customtype=github.com/cortexproject/cortex/pkg/ingester/client.LabelAdapter" json:"annotations"`
-	Value       float64                                                            `protobuf:"fixed64,4,opt,name=value,proto3" json:"value,omitempty"`
-	ActiveAt    time.Time                                                          `protobuf:"bytes,5,opt,name=active_at,json=activeAt,proto3,stdtime" json:"active_at"`
-	FiredAt     time.Time                                                          `protobuf:"bytes,6,opt,name=fired_at,json=firedAt,proto3,stdtime" json:"fired_at"`
-	ResolvedAt  time.Time                                                          `protobuf:"bytes,7,opt,name=resolved_at,json=resolvedAt,proto3,stdtime" json:"resolved_at"`
-	LastSentAt  time.Time                                                          `protobuf:"bytes,8,opt,name=last_sent_at,json=lastSentAt,proto3,stdtime" json:"last_sent_at"`
-	ValidUntil  time.Time                                                          `protobuf:"bytes,9,opt,name=valid_until,json=validUntil,proto3,stdtime" json:"valid_until"`
-}
-
-func (m *AlertDesc) Reset()      { *m = AlertDesc{} }
-func (*AlertDesc) ProtoMessage() {}
-func (*AlertDesc) Descriptor() ([]byte, []int) {
-	return fileDescriptor_8e722d3e922f0937, []int{2}
-}
-func (m *AlertDesc) XXX_Unmarshal(b []byte) error {
-	return m.Unmarshal(b)
-}
-func (m *AlertDesc) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	if deterministic {
-		return xxx_messageInfo_AlertDesc.Marshal(b, m, deterministic)
-	} else {
-		b = b[:cap(b)]
-		n, err := m.MarshalTo(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], nil
-	}
-}
-func (m *AlertDesc) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_AlertDesc.Merge(m, src)
-}
-func (m *AlertDesc) XXX_Size() int {
-	return m.Size()
-}
-func (m *AlertDesc) XXX_DiscardUnknown() {
-	xxx_messageInfo_AlertDesc.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_AlertDesc proto.InternalMessageInfo
-
-func (m *AlertDesc) GetState() string {
-	if m != nil {
-		return m.State
-	}
-	return ""
-}
-
-func (m *AlertDesc) GetValue() float64 {
-	if m != nil {
-		return m.Value
-	}
-	return 0
-}
-
-func (m *AlertDesc) GetActiveAt() time.Time {
-	if m != nil {
-		return m.ActiveAt
-	}
-	return time.Time{}
-}
-
-func (m *AlertDesc) GetFiredAt() time.Time {
-	if m != nil {
-		return m.FiredAt
-	}
-	return time.Time{}
-}
-
-func (m *AlertDesc) GetResolvedAt() time.Time {
-	if m != nil {
-		return m.ResolvedAt
-	}
-	return time.Time{}
-}
-
-func (m *AlertDesc) GetLastSentAt() time.Time {
-	if m != nil {
-		return m.LastSentAt
-	}
-	return time.Time{}
-}
-
-func (m *AlertDesc) GetValidUntil() time.Time {
-	if m != nil {
-		return m.ValidUntil
-	}
-	return time.Time{}
-}
-
 func init() {
 	proto.RegisterType((*RuleGroupDesc)(nil), "rules.RuleGroupDesc")
 	proto.RegisterType((*RuleDesc)(nil), "rules.RuleDesc")
-	proto.RegisterType((*AlertDesc)(nil), "rules.AlertDesc")
 }
 
 func init() { proto.RegisterFile("rules.proto", fileDescriptor_8e722d3e922f0937) }
 
 var fileDescriptor_8e722d3e922f0937 = []byte{
-	// 651 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xc4, 0x54, 0xbf, 0x6f, 0xd4, 0x30,
-	0x14, 0x3e, 0xf7, 0x7a, 0xbf, 0x7c, 0x20, 0xc0, 0x42, 0xc8, 0x54, 0xc8, 0x77, 0xaa, 0x84, 0x74,
-	0x0b, 0x39, 0xa9, 0x88, 0x89, 0x01, 0xae, 0x6a, 0x81, 0x81, 0x01, 0x05, 0x58, 0x58, 0x2a, 0x5f,
-	0xf2, 0x9a, 0x06, 0x7c, 0x71, 0x64, 0x3b, 0x27, 0x16, 0x24, 0x16, 0xf6, 0x8e, 0xfc, 0x09, 0xfc,
-	0x29, 0x1d, 0xbb, 0x51, 0x31, 0x14, 0x9a, 0x2e, 0x2c, 0x48, 0xfd, 0x13, 0x90, 0xed, 0xa4, 0x57,
-	0xc1, 0xd2, 0x22, 0x01, 0x53, 0xfc, 0xf9, 0xf9, 0x7d, 0xef, 0x7b, 0xcf, 0x9f, 0x83, 0xfb, 0xaa,
-	0x10, 0xa0, 0x83, 0x5c, 0x49, 0x23, 0x49, 0xcb, 0x81, 0x95, 0x3b, 0x49, 0x6a, 0x76, 0x8a, 0x69,
-	0x10, 0xc9, 0xd9, 0x38, 0x91, 0x89, 0x1c, 0xbb, 0xe8, 0xb4, 0xd8, 0x76, 0xc8, 0x01, 0xb7, 0xf2,
-	0x59, 0x2b, 0x2c, 0x91, 0x32, 0x11, 0xb0, 0x38, 0x15, 0x17, 0x8a, 0x9b, 0x54, 0x66, 0x55, 0x7c,
-	0xf0, 0x6b, 0xdc, 0xa4, 0x33, 0xd0, 0x86, 0xcf, 0xf2, 0xea, 0xc0, 0xc3, 0x33, 0xf5, 0x22, 0xa9,
-	0x0c, 0xbc, 0xcd, 0x95, 0x7c, 0x0d, 0x91, 0xa9, 0xd0, 0x38, 0x7f, 0x93, 0x8c, 0xd3, 0x2c, 0x01,
-	0x6d, 0x40, 0x8d, 0x23, 0x91, 0x42, 0x56, 0x87, 0x3c, 0xc3, 0xea, 0x67, 0x84, 0x2f, 0x87, 0x85,
-	0x80, 0xc7, 0x4a, 0x16, 0xf9, 0x06, 0xe8, 0x88, 0x10, 0xbc, 0x9c, 0xf1, 0x19, 0x50, 0x34, 0x44,
-	0xa3, 0x5e, 0xe8, 0xd6, 0xe4, 0x16, 0xee, 0xd9, 0xaf, 0xce, 0x79, 0x04, 0x74, 0xc9, 0x05, 0x16,
-	0x1b, 0xe4, 0x01, 0xee, 0xa6, 0x99, 0x01, 0x35, 0xe7, 0x82, 0x36, 0x87, 0x68, 0xd4, 0x5f, 0xbb,
-	0x19, 0x78, 0xe5, 0x41, 0xad, 0x3c, 0xd8, 0xa8, 0x3a, 0x5b, 0xef, 0xee, 0x1d, 0x0e, 0x1a, 0x1f,
-	0xbf, 0x0e, 0x50, 0x78, 0x9a, 0x44, 0x6e, 0x63, 0x3f, 0x3f, 0xba, 0x3c, 0x6c, 0x8e, 0xfa, 0x6b,
-	0x57, 0x02, 0x3f, 0x5a, 0xab, 0xcb, 0x4a, 0x0a, 0x7d, 0x94, 0x50, 0xdc, 0x89, 0x41, 0x80, 0x81,
-	0x98, 0xb6, 0x86, 0x68, 0xd4, 0x0d, 0x6b, 0x68, 0x35, 0x17, 0x1a, 0x14, 0x6d, 0x7b, 0xcd, 0x76,
-	0xbd, 0xfa, 0xa3, 0x89, 0xbb, 0x35, 0x83, 0x3d, 0x60, 0x67, 0x53, 0x37, 0x65, 0xd7, 0xe4, 0x06,
-	0x6e, 0x2b, 0x88, 0xa4, 0x8a, 0xab, 0x8e, 0x2a, 0x44, 0xae, 0xe3, 0x16, 0x17, 0xa0, 0x8c, 0xeb,
-	0xa5, 0x17, 0x7a, 0x40, 0xee, 0xe1, 0xe6, 0xb6, 0x54, 0x74, 0xf9, 0xfc, 0xfd, 0xd9, 0xf3, 0x44,
-	0xe3, 0xb6, 0xe0, 0x53, 0x10, 0x9a, 0xb6, 0x5c, 0x6f, 0xd7, 0x82, 0x6a, 0xfc, 0x4f, 0xed, 0xee,
-	0x33, 0x9e, 0xaa, 0xf5, 0x27, 0x36, 0xe3, 0xcb, 0xe1, 0xe0, 0x4f, 0x2e, 0xd3, 0xd3, 0x4c, 0x62,
-	0x9e, 0x1b, 0x50, 0x61, 0x55, 0x8a, 0xbc, 0xc3, 0x7d, 0x9e, 0x65, 0xd2, 0x38, 0x45, 0x9a, 0xb6,
-	0xff, 0x7e, 0xe5, 0xb3, 0xf5, 0xec, 0x00, 0xb5, 0xe1, 0x06, 0x68, 0xc7, 0x0f, 0xd0, 0x01, 0x3b,
-	0xee, 0x1d, 0xe0, 0xc2, 0xec, 0xd0, 0xae, 0x1f, 0xb7, 0x47, 0xd6, 0x5b, 0x82, 0x6b, 0xb3, 0xa9,
-	0x94, 0x54, 0xb4, 0xe7, 0xbd, 0x75, 0xba, 0x41, 0x46, 0xb8, 0xed, 0xe6, 0xaf, 0x29, 0x76, 0x5d,
-	0x5c, 0xad, 0xbc, 0x31, 0xb1, 0x9b, 0xce, 0x1c, 0x55, 0x7c, 0xf5, 0x43, 0x0b, 0xf7, 0x4e, 0x77,
-	0x17, 0x1a, 0xd0, 0x59, 0x0d, 0x8b, 0xdb, 0x58, 0xfa, 0x6f, 0xb7, 0xd1, 0xfc, 0xf7, 0xb7, 0x31,
-	0xe7, 0xa2, 0x00, 0x67, 0x5d, 0x14, 0x7a, 0x40, 0x26, 0xb8, 0xc7, 0x23, 0x93, 0xce, 0x61, 0x8b,
-	0x1b, 0xf7, 0x9a, 0xfa, 0x6b, 0x2b, 0xbf, 0x99, 0xfa, 0x45, 0xfd, 0xbb, 0xf1, 0xae, 0xde, 0x75,
-	0xaf, 0xd6, 0xa7, 0x4d, 0x8c, 0x7d, 0xf6, 0xdb, 0xa9, 0x82, 0xd8, 0x32, 0xb4, 0x2f, 0xc0, 0xd0,
-	0x71, 0x59, 0x13, 0x43, 0x36, 0x71, 0x5f, 0x81, 0x96, 0x62, 0xee, 0x39, 0x3a, 0x17, 0xe0, 0xc0,
-	0x75, 0xe2, 0xc4, 0x90, 0x47, 0xf8, 0x92, 0xf5, 0xcb, 0x96, 0x86, 0xcc, 0x58, 0x9e, 0xee, 0x45,
-	0x78, 0x6c, 0xe6, 0x73, 0xc8, 0x8c, 0x97, 0x33, 0xe7, 0x22, 0x8d, 0xb7, 0x8a, 0xcc, 0xa4, 0xc2,
-	0x59, 0xf1, 0xdc, 0x34, 0x2e, 0xf1, 0xa5, 0xcd, 0x5b, 0xbf, 0xbf, 0x7f, 0xc4, 0x1a, 0x07, 0x47,
-	0xac, 0x71, 0x72, 0xc4, 0xd0, 0xfb, 0x92, 0xa1, 0x4f, 0x25, 0x43, 0x7b, 0x25, 0x43, 0xfb, 0x25,
-	0x43, 0xdf, 0x4a, 0x86, 0xbe, 0x97, 0xac, 0x71, 0x52, 0x32, 0xb4, 0x7b, 0xcc, 0x1a, 0xfb, 0xc7,
-	0xac, 0x71, 0x70, 0xcc, 0x1a, 0xaf, 0xfc, 0x2f, 0x6e, 0xda, 0x76, 0x65, 0xee, 0xfe, 0x0c, 0x00,
-	0x00, 0xff, 0xff, 0x26, 0xdc, 0xc9, 0xc9, 0x5d, 0x06, 0x00, 0x00,
+	// 456 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x51, 0x41, 0x8b, 0xd3, 0x40,
+	0x14, 0xce, 0x6c, 0xd3, 0x98, 0x4e, 0x59, 0xac, 0x83, 0xc8, 0xb8, 0xc8, 0xb4, 0x2c, 0x08, 0xbd,
+	0x98, 0xc0, 0x8a, 0x27, 0x0f, 0x6a, 0x59, 0x50, 0x8a, 0x07, 0xc9, 0xd1, 0xdb, 0x34, 0x7d, 0x1b,
+	0xa3, 0xb3, 0x99, 0x30, 0x33, 0x11, 0x2f, 0x82, 0x3f, 0xc1, 0xa3, 0x3f, 0xc1, 0x9f, 0xb2, 0x37,
+	0x7b, 0x5c, 0x3c, 0xac, 0x36, 0xbd, 0x78, 0xdc, 0x3f, 0x20, 0xc8, 0xcc, 0xa4, 0x6e, 0x8f, 0x22,
+	0xec, 0x29, 0xef, 0xcb, 0x9b, 0xef, 0xbd, 0xef, 0xfb, 0x1e, 0x1e, 0xaa, 0x46, 0x80, 0x4e, 0x6a,
+	0x25, 0x8d, 0x24, 0x7d, 0x07, 0x0e, 0x1e, 0x14, 0xa5, 0x79, 0xd3, 0x2c, 0x92, 0x5c, 0x9e, 0xa6,
+	0x85, 0x2c, 0x64, 0xea, 0xba, 0x8b, 0xe6, 0xc4, 0x21, 0x07, 0x5c, 0xe5, 0x59, 0x07, 0xac, 0x90,
+	0xb2, 0x10, 0x70, 0xf5, 0x6a, 0xd9, 0x28, 0x6e, 0x4a, 0x59, 0x75, 0xfd, 0xa7, 0x3b, 0xe3, 0x72,
+	0xa9, 0x0c, 0x7c, 0xa8, 0x95, 0x7c, 0x0b, 0xb9, 0xe9, 0x50, 0x5a, 0xbf, 0x2b, 0xd2, 0xb2, 0x2a,
+	0x40, 0x1b, 0x50, 0x69, 0x2e, 0x4a, 0xa8, 0xb6, 0x2d, 0x3f, 0xe1, 0xf0, 0x1b, 0xc2, 0xfb, 0x59,
+	0x23, 0xe0, 0xb9, 0x92, 0x4d, 0x7d, 0x0c, 0x3a, 0x27, 0x04, 0x87, 0x15, 0x3f, 0x05, 0x8a, 0x26,
+	0x68, 0x3a, 0xc8, 0x5c, 0x4d, 0xee, 0xe1, 0x81, 0xfd, 0xea, 0x9a, 0xe7, 0x40, 0xf7, 0x5c, 0xe3,
+	0xea, 0x07, 0x79, 0x82, 0xe3, 0xb2, 0x32, 0xa0, 0xde, 0x73, 0x41, 0x7b, 0x13, 0x34, 0x1d, 0x1e,
+	0xdd, 0x4d, 0xbc, 0xf0, 0x64, 0x2b, 0x3c, 0x39, 0xee, 0x84, 0xcf, 0xe2, 0xb3, 0x8b, 0x71, 0xf0,
+	0xe5, 0xc7, 0x18, 0x65, 0x7f, 0x49, 0xe4, 0x3e, 0xf6, 0xf1, 0xd0, 0x70, 0xd2, 0x9b, 0x0e, 0x8f,
+	0x6e, 0x26, 0x3e, 0x39, 0xab, 0xcb, 0x4a, 0xca, 0x7c, 0xd7, 0x2a, 0x6b, 0x34, 0x28, 0x1a, 0x79,
+	0x65, 0xb6, 0x9e, 0x87, 0x71, 0x7f, 0x14, 0xcd, 0xc3, 0xf8, 0xc6, 0x28, 0x9e, 0x87, 0x71, 0x3c,
+	0x1a, 0x1c, 0xfe, 0xde, 0xc3, 0xf1, 0x96, 0x69, 0x29, 0x36, 0x93, 0xad, 0x19, 0x5b, 0x93, 0x3b,
+	0x38, 0x52, 0x90, 0x4b, 0xb5, 0xec, 0x9c, 0x74, 0x88, 0xdc, 0xc6, 0x7d, 0x2e, 0x40, 0x19, 0xe7,
+	0x61, 0x90, 0x79, 0x40, 0x1e, 0xe1, 0xde, 0x89, 0x54, 0x34, 0xfc, 0x77, 0x5f, 0xf6, 0x3d, 0xd1,
+	0x38, 0x12, 0x7c, 0x01, 0x42, 0xd3, 0xbe, 0xf3, 0x74, 0x2b, 0xe9, 0x62, 0x7f, 0x69, 0xff, 0xbe,
+	0xe2, 0xa5, 0x9a, 0xbd, 0xb0, 0x8c, 0xef, 0x17, 0xe3, 0xff, 0x39, 0xa2, 0x1f, 0xf3, 0x6c, 0xc9,
+	0x6b, 0x03, 0x2a, 0xeb, 0x56, 0x91, 0x8f, 0x78, 0xc8, 0xab, 0x4a, 0x1a, 0xa7, 0x48, 0xd3, 0xe8,
+	0xfa, 0x37, 0xef, 0xee, 0x73, 0x57, 0xd8, 0x9f, 0x3d, 0x5e, 0xad, 0x59, 0x70, 0xbe, 0x66, 0xc1,
+	0xe5, 0x9a, 0xa1, 0x4f, 0x2d, 0x43, 0x5f, 0x5b, 0x86, 0xce, 0x5a, 0x86, 0x56, 0x2d, 0x43, 0x3f,
+	0x5b, 0x86, 0x7e, 0xb5, 0x2c, 0xb8, 0x6c, 0x19, 0xfa, 0xbc, 0x61, 0xc1, 0x6a, 0xc3, 0x82, 0xf3,
+	0x0d, 0x0b, 0x5e, 0xfb, 0x13, 0x2f, 0x22, 0x17, 0xec, 0xc3, 0x3f, 0x01, 0x00, 0x00, 0xff, 0xff,
+	0x15, 0x3f, 0x81, 0xc2, 0x3c, 0x03, 0x00, 0x00,
 }
 
 func (this *RuleGroupDesc) Equal(that interface{}) bool {
@@ -399,9 +252,6 @@ func (this *RuleGroupDesc) Equal(that interface{}) bool {
 		if !this.Rules[i].Equal(that1.Rules[i]) {
 			return false
 		}
-	}
-	if this.Deleted != that1.Deleted {
-		return false
 	}
 	if this.User != that1.User {
 		return false
@@ -455,88 +305,13 @@ func (this *RuleDesc) Equal(that interface{}) bool {
 			return false
 		}
 	}
-	if this.State != that1.State {
-		return false
-	}
-	if this.Health != that1.Health {
-		return false
-	}
-	if this.LastError != that1.LastError {
-		return false
-	}
-	if len(this.Alerts) != len(that1.Alerts) {
-		return false
-	}
-	for i := range this.Alerts {
-		if !this.Alerts[i].Equal(that1.Alerts[i]) {
-			return false
-		}
-	}
-	return true
-}
-func (this *AlertDesc) Equal(that interface{}) bool {
-	if that == nil {
-		return this == nil
-	}
-
-	that1, ok := that.(*AlertDesc)
-	if !ok {
-		that2, ok := that.(AlertDesc)
-		if ok {
-			that1 = &that2
-		} else {
-			return false
-		}
-	}
-	if that1 == nil {
-		return this == nil
-	} else if this == nil {
-		return false
-	}
-	if this.State != that1.State {
-		return false
-	}
-	if len(this.Labels) != len(that1.Labels) {
-		return false
-	}
-	for i := range this.Labels {
-		if !this.Labels[i].Equal(that1.Labels[i]) {
-			return false
-		}
-	}
-	if len(this.Annotations) != len(that1.Annotations) {
-		return false
-	}
-	for i := range this.Annotations {
-		if !this.Annotations[i].Equal(that1.Annotations[i]) {
-			return false
-		}
-	}
-	if this.Value != that1.Value {
-		return false
-	}
-	if !this.ActiveAt.Equal(that1.ActiveAt) {
-		return false
-	}
-	if !this.FiredAt.Equal(that1.FiredAt) {
-		return false
-	}
-	if !this.ResolvedAt.Equal(that1.ResolvedAt) {
-		return false
-	}
-	if !this.LastSentAt.Equal(that1.LastSentAt) {
-		return false
-	}
-	if !this.ValidUntil.Equal(that1.ValidUntil) {
-		return false
-	}
 	return true
 }
 func (this *RuleGroupDesc) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 10)
+	s := make([]string, 0, 9)
 	s = append(s, "&rules.RuleGroupDesc{")
 	s = append(s, "Name: "+fmt.Sprintf("%#v", this.Name)+",\n")
 	s = append(s, "Namespace: "+fmt.Sprintf("%#v", this.Namespace)+",\n")
@@ -544,7 +319,6 @@ func (this *RuleGroupDesc) GoString() string {
 	if this.Rules != nil {
 		s = append(s, "Rules: "+fmt.Sprintf("%#v", this.Rules)+",\n")
 	}
-	s = append(s, "Deleted: "+fmt.Sprintf("%#v", this.Deleted)+",\n")
 	s = append(s, "User: "+fmt.Sprintf("%#v", this.User)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
@@ -553,7 +327,7 @@ func (this *RuleDesc) GoString() string {
 	if this == nil {
 		return "nil"
 	}
-	s := make([]string, 0, 14)
+	s := make([]string, 0, 10)
 	s = append(s, "&rules.RuleDesc{")
 	s = append(s, "Expr: "+fmt.Sprintf("%#v", this.Expr)+",\n")
 	s = append(s, "Record: "+fmt.Sprintf("%#v", this.Record)+",\n")
@@ -561,30 +335,6 @@ func (this *RuleDesc) GoString() string {
 	s = append(s, "For: "+fmt.Sprintf("%#v", this.For)+",\n")
 	s = append(s, "Labels: "+fmt.Sprintf("%#v", this.Labels)+",\n")
 	s = append(s, "Annotations: "+fmt.Sprintf("%#v", this.Annotations)+",\n")
-	s = append(s, "State: "+fmt.Sprintf("%#v", this.State)+",\n")
-	s = append(s, "Health: "+fmt.Sprintf("%#v", this.Health)+",\n")
-	s = append(s, "LastError: "+fmt.Sprintf("%#v", this.LastError)+",\n")
-	if this.Alerts != nil {
-		s = append(s, "Alerts: "+fmt.Sprintf("%#v", this.Alerts)+",\n")
-	}
-	s = append(s, "}")
-	return strings.Join(s, "")
-}
-func (this *AlertDesc) GoString() string {
-	if this == nil {
-		return "nil"
-	}
-	s := make([]string, 0, 13)
-	s = append(s, "&rules.AlertDesc{")
-	s = append(s, "State: "+fmt.Sprintf("%#v", this.State)+",\n")
-	s = append(s, "Labels: "+fmt.Sprintf("%#v", this.Labels)+",\n")
-	s = append(s, "Annotations: "+fmt.Sprintf("%#v", this.Annotations)+",\n")
-	s = append(s, "Value: "+fmt.Sprintf("%#v", this.Value)+",\n")
-	s = append(s, "ActiveAt: "+fmt.Sprintf("%#v", this.ActiveAt)+",\n")
-	s = append(s, "FiredAt: "+fmt.Sprintf("%#v", this.FiredAt)+",\n")
-	s = append(s, "ResolvedAt: "+fmt.Sprintf("%#v", this.ResolvedAt)+",\n")
-	s = append(s, "LastSentAt: "+fmt.Sprintf("%#v", this.LastSentAt)+",\n")
-	s = append(s, "ValidUntil: "+fmt.Sprintf("%#v", this.ValidUntil)+",\n")
 	s = append(s, "}")
 	return strings.Join(s, "")
 }
@@ -599,7 +349,7 @@ func valueToGoStringRules(v interface{}, typ string) string {
 func (m *RuleGroupDesc) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
-	n, err := m.MarshalTo(dAtA)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
 		return nil, err
 	}
@@ -607,65 +357,65 @@ func (m *RuleGroupDesc) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *RuleGroupDesc) MarshalTo(dAtA []byte) (int, error) {
-	var i int
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RuleGroupDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
 	_ = i
 	var l int
 	_ = l
-	if len(m.Name) > 0 {
-		dAtA[i] = 0xa
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.Name)))
-		i += copy(dAtA[i:], m.Name)
-	}
-	if len(m.Namespace) > 0 {
-		dAtA[i] = 0x12
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.Namespace)))
-		i += copy(dAtA[i:], m.Namespace)
-	}
-	dAtA[i] = 0x1a
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdDuration(m.Interval)))
-	n1, err := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.Interval, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n1
-	if len(m.Rules) > 0 {
-		for _, msg := range m.Rules {
-			dAtA[i] = 0x22
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if m.Deleted {
-		dAtA[i] = 0x28
-		i++
-		if m.Deleted {
-			dAtA[i] = 1
-		} else {
-			dAtA[i] = 0
-		}
-		i++
-	}
 	if len(m.User) > 0 {
-		dAtA[i] = 0x32
-		i++
+		i -= len(m.User)
+		copy(dAtA[i:], m.User)
 		i = encodeVarintRules(dAtA, i, uint64(len(m.User)))
-		i += copy(dAtA[i:], m.User)
+		i--
+		dAtA[i] = 0x32
 	}
-	return i, nil
+	if len(m.Rules) > 0 {
+		for iNdEx := len(m.Rules) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Rules[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintRules(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x22
+		}
+	}
+	n1, err1 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.Interval, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.Interval):])
+	if err1 != nil {
+		return 0, err1
+	}
+	i -= n1
+	i = encodeVarintRules(dAtA, i, uint64(n1))
+	i--
+	dAtA[i] = 0x1a
+	if len(m.Namespace) > 0 {
+		i -= len(m.Namespace)
+		copy(dAtA[i:], m.Namespace)
+		i = encodeVarintRules(dAtA, i, uint64(len(m.Namespace)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if len(m.Name) > 0 {
+		i -= len(m.Name)
+		copy(dAtA[i:], m.Name)
+		i = encodeVarintRules(dAtA, i, uint64(len(m.Name)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
 }
 
 func (m *RuleDesc) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
-	n, err := m.MarshalTo(dAtA)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
 		return nil, err
 	}
@@ -673,195 +423,85 @@ func (m *RuleDesc) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *RuleDesc) MarshalTo(dAtA []byte) (int, error) {
-	var i int
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RuleDesc) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
 	_ = i
 	var l int
 	_ = l
-	if len(m.Expr) > 0 {
-		dAtA[i] = 0xa
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.Expr)))
-		i += copy(dAtA[i:], m.Expr)
+	if len(m.Annotations) > 0 {
+		for iNdEx := len(m.Annotations) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size := m.Annotations[iNdEx].Size()
+				i -= size
+				if _, err := m.Annotations[iNdEx].MarshalTo(dAtA[i:]); err != nil {
+					return 0, err
+				}
+				i = encodeVarintRules(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x32
+		}
+	}
+	if len(m.Labels) > 0 {
+		for iNdEx := len(m.Labels) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size := m.Labels[iNdEx].Size()
+				i -= size
+				if _, err := m.Labels[iNdEx].MarshalTo(dAtA[i:]); err != nil {
+					return 0, err
+				}
+				i = encodeVarintRules(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x2a
+		}
+	}
+	n2, err2 := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.For, dAtA[i-github_com_gogo_protobuf_types.SizeOfStdDuration(m.For):])
+	if err2 != nil {
+		return 0, err2
+	}
+	i -= n2
+	i = encodeVarintRules(dAtA, i, uint64(n2))
+	i--
+	dAtA[i] = 0x22
+	if len(m.Alert) > 0 {
+		i -= len(m.Alert)
+		copy(dAtA[i:], m.Alert)
+		i = encodeVarintRules(dAtA, i, uint64(len(m.Alert)))
+		i--
+		dAtA[i] = 0x1a
 	}
 	if len(m.Record) > 0 {
-		dAtA[i] = 0x12
-		i++
+		i -= len(m.Record)
+		copy(dAtA[i:], m.Record)
 		i = encodeVarintRules(dAtA, i, uint64(len(m.Record)))
-		i += copy(dAtA[i:], m.Record)
+		i--
+		dAtA[i] = 0x12
 	}
-	if len(m.Alert) > 0 {
-		dAtA[i] = 0x1a
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.Alert)))
-		i += copy(dAtA[i:], m.Alert)
-	}
-	dAtA[i] = 0x22
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdDuration(m.For)))
-	n2, err := github_com_gogo_protobuf_types.StdDurationMarshalTo(m.For, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n2
-	if len(m.Labels) > 0 {
-		for _, msg := range m.Labels {
-			dAtA[i] = 0x2a
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if len(m.Annotations) > 0 {
-		for _, msg := range m.Annotations {
-			dAtA[i] = 0x32
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if len(m.State) > 0 {
-		dAtA[i] = 0x3a
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.State)))
-		i += copy(dAtA[i:], m.State)
-	}
-	if len(m.Health) > 0 {
-		dAtA[i] = 0x42
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.Health)))
-		i += copy(dAtA[i:], m.Health)
-	}
-	if len(m.LastError) > 0 {
-		dAtA[i] = 0x4a
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.LastError)))
-		i += copy(dAtA[i:], m.LastError)
-	}
-	if len(m.Alerts) > 0 {
-		for _, msg := range m.Alerts {
-			dAtA[i] = 0x52
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	return i, nil
-}
-
-func (m *AlertDesc) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalTo(dAtA)
-	if err != nil {
-		return nil, err
-	}
-	return dAtA[:n], nil
-}
-
-func (m *AlertDesc) MarshalTo(dAtA []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if len(m.State) > 0 {
+	if len(m.Expr) > 0 {
+		i -= len(m.Expr)
+		copy(dAtA[i:], m.Expr)
+		i = encodeVarintRules(dAtA, i, uint64(len(m.Expr)))
+		i--
 		dAtA[i] = 0xa
-		i++
-		i = encodeVarintRules(dAtA, i, uint64(len(m.State)))
-		i += copy(dAtA[i:], m.State)
 	}
-	if len(m.Labels) > 0 {
-		for _, msg := range m.Labels {
-			dAtA[i] = 0x12
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if len(m.Annotations) > 0 {
-		for _, msg := range m.Annotations {
-			dAtA[i] = 0x1a
-			i++
-			i = encodeVarintRules(dAtA, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(dAtA[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	if m.Value != 0 {
-		dAtA[i] = 0x21
-		i++
-		encoding_binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(m.Value))))
-		i += 8
-	}
-	dAtA[i] = 0x2a
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdTime(m.ActiveAt)))
-	n3, err := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.ActiveAt, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n3
-	dAtA[i] = 0x32
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdTime(m.FiredAt)))
-	n4, err := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.FiredAt, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n4
-	dAtA[i] = 0x3a
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdTime(m.ResolvedAt)))
-	n5, err := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.ResolvedAt, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n5
-	dAtA[i] = 0x42
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdTime(m.LastSentAt)))
-	n6, err := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.LastSentAt, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n6
-	dAtA[i] = 0x4a
-	i++
-	i = encodeVarintRules(dAtA, i, uint64(github_com_gogo_protobuf_types.SizeOfStdTime(m.ValidUntil)))
-	n7, err := github_com_gogo_protobuf_types.StdTimeMarshalTo(m.ValidUntil, dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n7
-	return i, nil
+	return len(dAtA) - i, nil
 }
 
 func encodeVarintRules(dAtA []byte, offset int, v uint64) int {
+	offset -= sovRules(v)
+	base := offset
 	for v >= 1<<7 {
 		dAtA[offset] = uint8(v&0x7f | 0x80)
 		v >>= 7
 		offset++
 	}
 	dAtA[offset] = uint8(v)
-	return offset + 1
+	return base
 }
 func (m *RuleGroupDesc) Size() (n int) {
 	if m == nil {
@@ -884,9 +524,6 @@ func (m *RuleGroupDesc) Size() (n int) {
 			l = e.Size()
 			n += 1 + l + sovRules(uint64(l))
 		}
-	}
-	if m.Deleted {
-		n += 2
 	}
 	l = len(m.User)
 	if l > 0 {
@@ -927,74 +564,11 @@ func (m *RuleDesc) Size() (n int) {
 			n += 1 + l + sovRules(uint64(l))
 		}
 	}
-	l = len(m.State)
-	if l > 0 {
-		n += 1 + l + sovRules(uint64(l))
-	}
-	l = len(m.Health)
-	if l > 0 {
-		n += 1 + l + sovRules(uint64(l))
-	}
-	l = len(m.LastError)
-	if l > 0 {
-		n += 1 + l + sovRules(uint64(l))
-	}
-	if len(m.Alerts) > 0 {
-		for _, e := range m.Alerts {
-			l = e.Size()
-			n += 1 + l + sovRules(uint64(l))
-		}
-	}
-	return n
-}
-
-func (m *AlertDesc) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	l = len(m.State)
-	if l > 0 {
-		n += 1 + l + sovRules(uint64(l))
-	}
-	if len(m.Labels) > 0 {
-		for _, e := range m.Labels {
-			l = e.Size()
-			n += 1 + l + sovRules(uint64(l))
-		}
-	}
-	if len(m.Annotations) > 0 {
-		for _, e := range m.Annotations {
-			l = e.Size()
-			n += 1 + l + sovRules(uint64(l))
-		}
-	}
-	if m.Value != 0 {
-		n += 9
-	}
-	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.ActiveAt)
-	n += 1 + l + sovRules(uint64(l))
-	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.FiredAt)
-	n += 1 + l + sovRules(uint64(l))
-	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.ResolvedAt)
-	n += 1 + l + sovRules(uint64(l))
-	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.LastSentAt)
-	n += 1 + l + sovRules(uint64(l))
-	l = github_com_gogo_protobuf_types.SizeOfStdTime(m.ValidUntil)
-	n += 1 + l + sovRules(uint64(l))
 	return n
 }
 
 func sovRules(x uint64) (n int) {
-	for {
-		n++
-		x >>= 7
-		if x == 0 {
-			break
-		}
-	}
-	return n
+	return (math_bits.Len64(x|1) + 6) / 7
 }
 func sozRules(x uint64) (n int) {
 	return sovRules(uint64((x << 1) ^ uint64((int64(x) >> 63))))
@@ -1003,12 +577,16 @@ func (this *RuleGroupDesc) String() string {
 	if this == nil {
 		return "nil"
 	}
+	repeatedStringForRules := "[]*RuleDesc{"
+	for _, f := range this.Rules {
+		repeatedStringForRules += strings.Replace(f.String(), "RuleDesc", "RuleDesc", 1) + ","
+	}
+	repeatedStringForRules += "}"
 	s := strings.Join([]string{`&RuleGroupDesc{`,
 		`Name:` + fmt.Sprintf("%v", this.Name) + `,`,
 		`Namespace:` + fmt.Sprintf("%v", this.Namespace) + `,`,
-		`Interval:` + strings.Replace(strings.Replace(this.Interval.String(), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
-		`Rules:` + strings.Replace(fmt.Sprintf("%v", this.Rules), "RuleDesc", "RuleDesc", 1) + `,`,
-		`Deleted:` + fmt.Sprintf("%v", this.Deleted) + `,`,
+		`Interval:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.Interval), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
+		`Rules:` + repeatedStringForRules + `,`,
 		`User:` + fmt.Sprintf("%v", this.User) + `,`,
 		`}`,
 	}, "")
@@ -1022,31 +600,9 @@ func (this *RuleDesc) String() string {
 		`Expr:` + fmt.Sprintf("%v", this.Expr) + `,`,
 		`Record:` + fmt.Sprintf("%v", this.Record) + `,`,
 		`Alert:` + fmt.Sprintf("%v", this.Alert) + `,`,
-		`For:` + strings.Replace(strings.Replace(this.For.String(), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
+		`For:` + strings.Replace(strings.Replace(fmt.Sprintf("%v", this.For), "Duration", "duration.Duration", 1), `&`, ``, 1) + `,`,
 		`Labels:` + fmt.Sprintf("%v", this.Labels) + `,`,
 		`Annotations:` + fmt.Sprintf("%v", this.Annotations) + `,`,
-		`State:` + fmt.Sprintf("%v", this.State) + `,`,
-		`Health:` + fmt.Sprintf("%v", this.Health) + `,`,
-		`LastError:` + fmt.Sprintf("%v", this.LastError) + `,`,
-		`Alerts:` + strings.Replace(fmt.Sprintf("%v", this.Alerts), "AlertDesc", "AlertDesc", 1) + `,`,
-		`}`,
-	}, "")
-	return s
-}
-func (this *AlertDesc) String() string {
-	if this == nil {
-		return "nil"
-	}
-	s := strings.Join([]string{`&AlertDesc{`,
-		`State:` + fmt.Sprintf("%v", this.State) + `,`,
-		`Labels:` + fmt.Sprintf("%v", this.Labels) + `,`,
-		`Annotations:` + fmt.Sprintf("%v", this.Annotations) + `,`,
-		`Value:` + fmt.Sprintf("%v", this.Value) + `,`,
-		`ActiveAt:` + strings.Replace(strings.Replace(this.ActiveAt.String(), "Timestamp", "timestamp.Timestamp", 1), `&`, ``, 1) + `,`,
-		`FiredAt:` + strings.Replace(strings.Replace(this.FiredAt.String(), "Timestamp", "timestamp.Timestamp", 1), `&`, ``, 1) + `,`,
-		`ResolvedAt:` + strings.Replace(strings.Replace(this.ResolvedAt.String(), "Timestamp", "timestamp.Timestamp", 1), `&`, ``, 1) + `,`,
-		`LastSentAt:` + strings.Replace(strings.Replace(this.LastSentAt.String(), "Timestamp", "timestamp.Timestamp", 1), `&`, ``, 1) + `,`,
-		`ValidUntil:` + strings.Replace(strings.Replace(this.ValidUntil.String(), "Timestamp", "timestamp.Timestamp", 1), `&`, ``, 1) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -1219,26 +775,6 @@ func (m *RuleGroupDesc) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 5:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Deleted", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.Deleted = bool(v != 0)
 		case 6:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field User", wireType)
@@ -1518,465 +1054,6 @@ func (m *RuleDesc) Unmarshal(dAtA []byte) error {
 			}
 			m.Annotations = append(m.Annotations, github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter{})
 			if err := m.Annotations[len(m.Annotations)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 7:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field State", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.State = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 8:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Health", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Health = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 9:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LastError", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.LastError = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 10:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Alerts", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Alerts = append(m.Alerts, &AlertDesc{})
-			if err := m.Alerts[len(m.Alerts)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipRules(dAtA[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthRules
-			}
-			if (iNdEx + skippy) < 0 {
-				return ErrInvalidLengthRules
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *AlertDesc) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowRules
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: AlertDesc: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: AlertDesc: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field State", wireType)
-			}
-			var stringLen uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				stringLen |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			intStringLen := int(stringLen)
-			if intStringLen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + intStringLen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.State = string(dAtA[iNdEx:postIndex])
-			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Labels = append(m.Labels, github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter{})
-			if err := m.Labels[len(m.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Annotations", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Annotations = append(m.Annotations, github_com_cortexproject_cortex_pkg_ingester_client.LabelAdapter{})
-			if err := m.Annotations[len(m.Annotations)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 4:
-			if wireType != 1 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Value", wireType)
-			}
-			var v uint64
-			if (iNdEx + 8) > l {
-				return io.ErrUnexpectedEOF
-			}
-			v = uint64(encoding_binary.LittleEndian.Uint64(dAtA[iNdEx:]))
-			iNdEx += 8
-			m.Value = float64(math.Float64frombits(v))
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ActiveAt", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.ActiveAt, dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 6:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field FiredAt", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.FiredAt, dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 7:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ResolvedAt", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.ResolvedAt, dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 8:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LastSentAt", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.LastSentAt, dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 9:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ValidUntil", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowRules
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthRules
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthRules
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := github_com_gogo_protobuf_types.StdTimeUnmarshal(&m.ValidUntil, dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex

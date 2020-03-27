@@ -8,23 +8,23 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/health/grpc_health_v1"
-
 	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/status"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
 	cortex_chunk "github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -41,24 +41,24 @@ var (
 
 // Config for an Ingester.
 type Config struct {
-	WALConfig        WALConfig             `yaml:"walconfig,omitempty"`
-	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler,omitempty"`
+	WALConfig        WALConfig             `yaml:"walconfig"`
+	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler"`
 
 	// Config for transferring chunks. Zero or negative = no retries.
-	MaxTransferRetries int `yaml:"max_transfer_retries,omitempty"`
+	MaxTransferRetries int `yaml:"max_transfer_retries"`
 
 	// Config for chunk flushing.
-	FlushCheckPeriod  time.Duration
-	RetainPeriod      time.Duration
-	MaxChunkIdle      time.Duration
-	MaxStaleChunkIdle time.Duration
-	FlushOpTimeout    time.Duration
-	MaxChunkAge       time.Duration
-	ChunkAgeJitter    time.Duration
-	ConcurrentFlushes int
-	SpreadFlushes     bool
+	FlushCheckPeriod  time.Duration `yaml:"flush_period"`
+	RetainPeriod      time.Duration `yaml:"retain_period"`
+	MaxChunkIdle      time.Duration `yaml:"max_chunk_idle_time"`
+	MaxStaleChunkIdle time.Duration `yaml:"max_stale_chunk_idle_time"`
+	FlushOpTimeout    time.Duration `yaml:"flush_op_timeout"`
+	MaxChunkAge       time.Duration `yaml:"max_chunk_age"`
+	ChunkAgeJitter    time.Duration `yaml:"chunk_age_jitter"`
+	ConcurrentFlushes int           `yaml:"concurrent_flushes"`
+	SpreadFlushes     bool          `yaml:"spread_flushes"`
 
-	RateUpdatePeriod time.Duration
+	RateUpdatePeriod time.Duration `yaml:"rate_update_period"`
 
 	// Use tsdb block storage
 	TSDBEnabled bool        `yaml:"-"`
@@ -84,8 +84,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.MaxChunkIdle, "ingester.max-chunk-idle", 5*time.Minute, "Maximum chunk idle time before flushing.")
 	f.DurationVar(&cfg.MaxStaleChunkIdle, "ingester.max-stale-chunk-idle", 0, "Maximum chunk idle time for chunks terminating in stale markers before flushing. 0 disables it and a stale series is not flushed until the max-chunk-idle timeout is reached.")
 	f.DurationVar(&cfg.MaxChunkAge, "ingester.max-chunk-age", 12*time.Hour, "Maximum chunk age before flushing.")
-	f.DurationVar(&cfg.ChunkAgeJitter, "ingester.chunk-age-jitter", 20*time.Minute, "Range of time to subtract from MaxChunkAge to spread out flushes")
-	f.BoolVar(&cfg.SpreadFlushes, "ingester.spread-flushes", false, "If true, spread series flushes across the whole period of MaxChunkAge")
+	f.DurationVar(&cfg.ChunkAgeJitter, "ingester.chunk-age-jitter", 20*time.Minute, "Range of time to subtract from -ingester.max-chunk-age to spread out flushes")
+	f.BoolVar(&cfg.SpreadFlushes, "ingester.spread-flushes", false, "If true, spread series flushes across the whole period of -ingester.max-chunk-age.")
 	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 50, "Number of concurrent goroutines flushing to dynamodb.")
 	f.DurationVar(&cfg.RateUpdatePeriod, "ingester.rate-update-period", 15*time.Second, "Period with which to update the per-user ingestion rates.")
 }
@@ -93,18 +93,18 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 // Ingester deals with "in flight" chunks.  Based on Prometheus 1.x
 // MemorySeriesStorage.
 type Ingester struct {
+	services.Service
+
 	cfg          Config
 	clientConfig client.Config
 
 	metrics *ingesterMetrics
 
-	chunkStore ChunkStore
-	lifecycler *ring.Lifecycler
-	limits     *validation.Overrides
-	limiter    *SeriesLimiter
-
-	quit chan struct{}
-	done sync.WaitGroup
+	chunkStore         ChunkStore
+	lifecycler         *ring.Lifecycler
+	limits             *validation.Overrides
+	limiter            *SeriesLimiter
+	subservicesWatcher *services.FailureWatcher
 
 	userStatesMtx sync.RWMutex // protects userStates and stopped
 	userStates    *userStates
@@ -117,6 +117,8 @@ type Ingester struct {
 
 	// This should never be nil.
 	wal WAL
+	// To be passed to the WAL.
+	registerer prometheus.Registerer
 
 	// Hook for injecting behaviour from tests.
 	preFlushUserSeries func()
@@ -159,8 +161,8 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 		metrics:      newIngesterMetrics(registerer, true),
 		limits:       limits,
 		chunkStore:   chunkStore,
-		quit:         make(chan struct{}),
-		flushQueues:  make([]*util.PriorityQueue, cfg.ConcurrentFlushes, cfg.ConcurrentFlushes),
+		flushQueues:  make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		registerer:   registerer,
 	}
 
 	var err error
@@ -172,13 +174,20 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 		return nil, err
 	}
 	i.limiter = NewSeriesLimiter(limits, i.lifecycler, cfg.LifecyclerConfig.RingConfig.ReplicationFactor, cfg.ShardByAllLabels)
+	i.subservicesWatcher = services.NewFailureWatcher()
+	i.subservicesWatcher.WatchService(i.lifecycler)
 
-	if cfg.WALConfig.Recover {
+	i.Service = services.NewBasicService(i.starting, i.loop, i.stopping)
+	return i, nil
+}
+
+func (i *Ingester) starting(ctx context.Context) error {
+	if i.cfg.WALConfig.Recover {
 		level.Info(util.Logger).Log("msg", "recovering from WAL")
 		start := time.Now()
 		if err := recoverFromWAL(i); err != nil {
 			level.Error(util.Logger).Log("msg", "failed to recover from WAL", "time", time.Since(start).String())
-			return nil, err
+			return errors.Wrap(err, "failed to recover from WAL")
 		}
 		elapsed := time.Since(start)
 		level.Info(util.Logger).Log("msg", "recovery from WAL completed", "time", elapsed.String())
@@ -187,32 +196,79 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 
 	// If the WAL recover happened, then the userStates would already be set.
 	if i.userStates == nil {
-		i.userStates = newUserStates(i.limiter, cfg, i.metrics)
+		i.userStates = newUserStates(i.limiter, i.cfg, i.metrics)
 	}
 
-	i.wal, err = newWAL(cfg.WALConfig, i.userStates.cp)
+	var err error
+	i.wal, err = newWAL(i.cfg.WALConfig, i.userStates.cp, i.registerer)
 	if err != nil {
-		return nil, err
+		return errors.Wrap(err, "starting WAL")
 	}
 
-	// Now that user states have been created, we can start the lifecycler
-	i.lifecycler.Start()
+	// Now that user states have been created, we can start the lifecycler.
+	// Important: we want to keep lifecycler running until we ask it to stop, so we need to give it independent context
+	if err := i.lifecycler.StartAsync(context.Background()); err != nil {
+		return errors.Wrap(err, "failed to start lifecycler")
+	}
+	if err := i.lifecycler.AwaitRunning(ctx); err != nil {
+		return errors.Wrap(err, "failed to start lifecycler")
+	}
 
-	i.flushQueuesDone.Add(cfg.ConcurrentFlushes)
-	for j := 0; j < cfg.ConcurrentFlushes; j++ {
+	i.startFlushLoops()
+
+	return nil
+}
+
+func (i *Ingester) startFlushLoops() {
+	i.flushQueuesDone.Add(i.cfg.ConcurrentFlushes)
+	for j := 0; j < i.cfg.ConcurrentFlushes; j++ {
 		i.flushQueues[j] = util.NewPriorityQueue(i.metrics.flushQueueLength)
 		go i.flushLoop(j)
 	}
+}
 
-	i.done.Add(1)
-	go i.loop()
+// NewForFlusher constructs a new Ingester to be used by flusher target.
+// Compared to the 'New' method:
+//   * Always replays the WAL.
+//   * Does not start the lifecycler.
+//   * No ingester v2.
+func NewForFlusher(cfg Config, clientConfig client.Config, chunkStore ChunkStore, registerer prometheus.Registerer) (*Ingester, error) {
+	if cfg.ingesterClientFactory == nil {
+		cfg.ingesterClientFactory = client.MakeIngesterClient
+	}
 
+	i := &Ingester{
+		cfg:          cfg,
+		clientConfig: clientConfig,
+		metrics:      newIngesterMetrics(registerer, true),
+		chunkStore:   chunkStore,
+		flushQueues:  make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		wal:          &noopWAL{},
+	}
+
+	i.Service = services.NewBasicService(i.startingForFlusher, i.loop, i.stopping)
 	return i, nil
 }
 
-func (i *Ingester) loop() {
-	defer i.done.Done()
+func (i *Ingester) startingForFlusher(ctx context.Context) error {
+	level.Info(util.Logger).Log("msg", "recovering from WAL")
 
+	// We recover from WAL always.
+	start := time.Now()
+	if err := recoverFromWAL(i); err != nil {
+		level.Error(util.Logger).Log("msg", "failed to recover from WAL", "time", time.Since(start).String())
+		return err
+	}
+	elapsed := time.Since(start)
+
+	level.Info(util.Logger).Log("msg", "recovery from WAL completed", "time", elapsed.String())
+	i.metrics.walReplayDuration.Set(elapsed.Seconds())
+
+	i.startFlushLoops()
+	return nil
+}
+
+func (i *Ingester) loop(ctx context.Context) error {
 	flushTicker := time.NewTicker(i.cfg.FlushCheckPeriod)
 	defer flushTicker.Stop()
 
@@ -227,28 +283,29 @@ func (i *Ingester) loop() {
 		case <-rateUpdateTicker.C:
 			i.userStates.updateRates()
 
-		case <-i.quit:
-			return
+		case <-ctx.Done():
+			return nil
+
+		case err := <-i.subservicesWatcher.Chan():
+			return errors.Wrap(err, "ingester subservice failed")
 		}
 	}
 }
 
-// Shutdown beings the process to stop this ingester.
-func (i *Ingester) Shutdown() {
-	select {
-	case <-i.quit:
-		// Ingester was already shutdown.
-		return
-	default:
-		// First wait for our flush loop to stop.
-		close(i.quit)
-		i.done.Wait()
+// stopping is run when ingester is asked to stop
+func (i *Ingester) stopping(_ error) error {
+	i.wal.Stop()
 
-		i.wal.Stop()
+	// This will prevent us accepting any more samples
+	i.stopIncomingRequests()
 
+	// Lifecycler can be nil if the ingester is for a flusher.
+	if i.lifecycler != nil {
 		// Next initiate our graceful exit from the ring.
-		i.lifecycler.Shutdown()
+		return services.StopAndAwaitTerminated(context.Background(), i.lifecycler)
 	}
+
+	return nil
 }
 
 // ShutdownHandler triggers the following set of operations in order:
@@ -258,24 +315,41 @@ func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
 	originalState := i.lifecycler.FlushOnShutdown()
 	// We want to flush the chunks if transfer fails irrespective of original flag.
 	i.lifecycler.SetFlushOnShutdown(true)
-	i.Shutdown()
+	_ = services.StopAndAwaitTerminated(context.Background(), i)
 	i.lifecycler.SetFlushOnShutdown(originalState)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// StopIncomingRequests is called during the shutdown process.
-func (i *Ingester) StopIncomingRequests() {
+// stopIncomingRequests is called during the shutdown process.
+func (i *Ingester) stopIncomingRequests() {
 	i.userStatesMtx.Lock()
 	defer i.userStatesMtx.Unlock()
 	i.stopped = true
 }
 
+// check that ingester has finished starting, i.e. it is in Running or Stopping state.
+// Why Stopping? Because ingester still runs, even when it is transferring data out in Stopping state.
+// Ingester handles this state on its own (via `stopped` flag).
+func (i *Ingester) checkRunningOrStopping() error {
+	s := i.State()
+	if s == services.Running || s == services.Stopping {
+		return nil
+	}
+	return status.Error(codes.Unavailable, s.String())
+}
+
 // Push implements client.IngesterServer
 func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.WriteResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2Push(ctx, req)
 	}
 
+	// NOTE: because we use `unsafe` in deserialisation, we must not
+	// retain anything from `req` past the call to ReuseSlice
 	defer client.ReuseSlice(req.Timeseries)
 
 	userID, err := user.ExtractOrgID(ctx)
@@ -300,6 +374,7 @@ func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.
 
 	for _, ts := range req.Timeseries {
 		for _, s := range ts.Samples {
+			// append() copies the memory in `ts.Labels` except on the error path
 			err := i.append(ctx, userID, ts.Labels, model.Time(s.TimestampMs), model.SampleValue(s.Value), req.Source, record)
 			if err == nil {
 				continue
@@ -311,12 +386,14 @@ func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.
 				continue
 			}
 
-			return nil, wrapWithUser(err, userID)
+			// non-validation error: abandon this request
+			return nil, grpcForwardableError(userID, http.StatusInternalServerError, err)
 		}
 	}
 
 	if lastPartialErr != nil {
-		return &client.WriteResponse{}, lastPartialErr.WrapWithUser(userID).WrappedError()
+		// grpcForwardableError turns the error into a string so it no longer references `req`
+		return &client.WriteResponse{}, grpcForwardableError(userID, lastPartialErr.code, lastPartialErr)
 	}
 
 	if record != nil {
@@ -330,6 +407,8 @@ func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.
 	return &client.WriteResponse{}, nil
 }
 
+// NOTE: memory for `labels` is unsafe; anything retained beyond the
+// life of this function must be copied
 func (i *Ingester) append(ctx context.Context, userID string, labels labelPairs, timestamp model.Time, value model.SampleValue, source client.WriteRequest_SourceEnum, record *Record) error {
 	labels.removeBlanks()
 
@@ -348,6 +427,7 @@ func (i *Ingester) append(ctx context.Context, userID string, labels labelPairs,
 		return fmt.Errorf("ingester stopping")
 	}
 
+	// getOrCreateSeries copies the memory for `labels`, except on the error path.
 	state, fp, series, err := i.userStates.getOrCreateSeries(ctx, userID, labels, record)
 	if err != nil {
 		if ve, ok := err.(*validationError); ok {
@@ -392,7 +472,7 @@ func (i *Ingester) append(ctx context.Context, userID string, labels labelPairs,
 		})
 	}
 
-	memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
+	i.metrics.memoryChunks.Add(float64(len(series.chunkDescs) - prevNumChunks))
 	i.metrics.ingestedSamples.Inc()
 	switch source {
 	case client.RULE:
@@ -408,6 +488,10 @@ func (i *Ingester) append(ctx context.Context, userID string, labels labelPairs,
 
 // Query implements service.IngesterServer
 func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client.QueryResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2Query(ctx, req)
 	}
@@ -471,8 +555,12 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 
 // QueryStream implements service.IngesterServer
 func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_QueryStreamServer) error {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return err
+	}
+
 	if i.cfg.TSDBEnabled {
-		return fmt.Errorf("Unimplemented for V2")
+		return i.v2QueryStream(req, stream)
 	}
 
 	log, ctx := spanlogger.New(stream.Context(), "QueryStream")
@@ -528,8 +616,8 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 		if len(batch) == 0 {
 			return nil
 		}
-		err = stream.Send(&client.QueryStreamResponse{
-			Timeseries: batch,
+		err = client.SendQueryStream(stream, &client.QueryStreamResponse{
+			Chunkseries: batch,
 		})
 		batch = batch[:0]
 		return err
@@ -547,6 +635,10 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 
 // LabelValues returns all label values that are associated with a given label name.
 func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2LabelValues(ctx, req)
 	}
@@ -568,6 +660,10 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 
 // LabelNames return all the label names.
 func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest) (*client.LabelNamesResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2LabelNames(ctx, req)
 	}
@@ -589,6 +685,10 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 
 // MetricsForLabelMatchers returns all the metrics which match a set of matchers.
 func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.MetricsForLabelMatchersRequest) (*client.MetricsForLabelMatchersResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2MetricsForLabelMatchers(ctx, req)
 	}
@@ -632,6 +732,10 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 
 // UserStats returns ingestion statistics for the current user.
 func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) (*client.UserStatsResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2UserStats(ctx, req)
 	}
@@ -657,6 +761,10 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 
 // AllUserStats returns ingestion statistics for all users known to this ingester.
 func (i *Ingester) AllUserStats(ctx context.Context, req *client.UserStatsRequest) (*client.UsersStatsResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return nil, err
+	}
+
 	if i.cfg.TSDBEnabled {
 		return i.v2AllUserStats(ctx, req)
 	}
@@ -686,6 +794,10 @@ func (i *Ingester) AllUserStats(ctx context.Context, req *client.UserStatsReques
 
 // Check implements the grpc healthcheck
 func (i *Ingester) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_NOT_SERVING}, nil
+	}
+
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
 }
 
@@ -694,13 +806,11 @@ func (i *Ingester) Watch(in *grpc_health_v1.HealthCheckRequest, stream grpc_heal
 	return status.Error(codes.Unimplemented, "Watching is not supported")
 }
 
-// ReadinessHandler is used to indicate to k8s when the ingesters are ready for
-// the addition removal of another ingester. Returns 204 when the ingester is
-// ready, 500 otherwise.
-func (i *Ingester) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
-	if err := i.lifecycler.CheckReady(r.Context()); err == nil {
-		w.WriteHeader(http.StatusNoContent)
-	} else {
-		http.Error(w, "Not ready: "+err.Error(), http.StatusServiceUnavailable)
+// CheckReady is the readiness handler used to indicate to k8s when the ingesters
+// are ready for the addition or removal of another ingester.
+func (i *Ingester) CheckReady(ctx context.Context) error {
+	if err := i.checkRunningOrStopping(); err != nil {
+		return fmt.Errorf("ingester not ready: %v", err)
 	}
+	return i.lifecycler.CheckReady(ctx)
 }

@@ -68,6 +68,30 @@ The ingester query API was improved over time, but defaults to the old behaviour
 
 ## Query Frontend
 
+- `-querier.parallelise-shardable-queries`
+
+   If set to true, will cause the query frontend to mutate incoming queries when possible by turning `sum` operations into sharded `sum` operations. This requires a shard-compatible schema (v10+). An abridged example:
+   `sum by (foo) (rate(bar{baz=”blip”}[1m]))` ->
+   ```
+   sum by (foo) (
+    sum by (foo) (rate(bar{baz=”blip”,__cortex_shard__=”0of16”}[1m])) or
+    sum by (foo) (rate(bar{baz=”blip”,__cortex_shard__=”1of16”}[1m])) or
+    ...
+    sum by (foo) (rate(bar{baz=”blip”,__cortex_shard__=”15of16”}[1m]))
+   )
+   ```
+   When enabled, the query-frontend requires a schema config to determine how/when to shard queries, either from a file or from flags (i.e. by the `config-yaml` CLI flag). This is the same schema config the queriers consume.
+   It's also advised to increase downstream concurrency controls as well to account for more queries of smaller sizes:
+
+   - `querier.max-outstanding-requests-per-tenant`
+   - `querier.max-query-parallelism`
+   - `querier.max-concurrent`
+   - `server.grpc-max-concurrent-streams` (for both query-frontends and queriers)
+
+   Furthermore, both querier and query-frontend components require the `querier.query-ingesters-within` parameter to know when to start sharding requests (ingester queries are not sharded). It's recommended to align this with `ingester.max-chunk-age`.
+
+   Instrumentation (traces) also scale with the number of sharded queries and it's suggested to account for increased throughput there as well (for instance via `JAEGER_REPORTER_MAX_QUEUE_SIZE`).
+
 - `-querier.align-querier-with-step`
 
    If set to true, will cause the query frontend to mutate incoming queries and align their start and end parameters to the step parameter of the query.  This improves the cacheability of the query results.
@@ -84,11 +108,11 @@ The ingester query API was improved over time, but defaults to the old behaviour
 
    When caching query results, it is desirable to prevent the caching of very recent results that might still be in flux.  Use this parameter to configure the age of results that should be excluded.
 
-- `-memcached.{hostname, service, timeout}`
+- `-frontend.memcached.{hostname, service, timeout}`
 
    Use these flags to specify the location and timeout of the memcached cluster used to cache query results.
 
-- `-redis.{endpoint, timeout}`
+- `-frontend.redis.{endpoint, timeout}`
 
    Use these flags to specify the location and timeout of the Redis service used to cache query results.
 
@@ -131,7 +155,7 @@ prefix these flags with `distributor.ha-tracker.`
 
 - `consul.hostname`
    Hostname and port of Consul.
-- `consul.acltoken`
+- `consul.acl-token`
    ACL token used to interact with Consul.
 - `consul.client-timeout`
    HTTP timeout when talking to Consul.
@@ -182,7 +206,12 @@ Flags for configuring KV store based on memberlist library. This feature is expe
    Timeout for writing 'packet' data.
 - `memberlist.transport-debug`
    Log debug transport messages. Note: global log.level must be at debug level as well.
-   
+- `memberlist.gossip-to-dead-nodes-time`
+   How long to keep gossiping to the nodes that seem to be dead. After this time, dead node is removed from list of nodes. If "dead" node appears again, it will simply join the cluster again, if its name is not reused by other node in the meantime. If the name has been reused, such a reanimated node will be ignored by other members.
+- `memberlist.dead-node-reclaim-time`
+   How soon can dead's node name be reused by a new node (using different IP). Disabled by default, name reclaim is not allowed until `gossip-to-dead-nodes-time` expires. This can be useful to set to low numbers when reusing node names, eg. in stateful sets.
+   If memberlist library detects that new node is trying to reuse the name of previous node, it will log message like this: `Conflicting address for ingester-6. Mine: 10.44.12.251:7946 Theirs: 10.44.12.54:7946 Old state: 2`. Node states are: "alive" = 0, "suspect" = 1 (doesn't respond, will be marked as dead if it doesn't respond), "dead" = 2.
+
 #### Multi KV
 
 This is a special key-value implementation that uses two different KV stores (eg. consul, etcd or memberlist). One of them is always marked as primary, and all reads and writes go to primary store. Other one, secondary, is only used for writes. The idea is that operator can use multi KV store to migrate from primary to secondary store in runtime.
@@ -259,7 +288,7 @@ It also talks to a KVStore and has it's own copies of the same flags used by the
 
 - `-ingester.spread-flushes`
 
-  Makes the ingester flush each timeseries at a specific point in the `max-chunk-age` cycle. This means multiple replicas of a chunk are very likely to contain the same contents which cuts chunk storage space by up to 66%. Set `-ingester.chunk-age-jitter` to `0` when using this option. If a chunk cache is configured (via `-memcached.hostname`) then duplicate chunk writes are skipped which cuts write IOPs.
+  Makes the ingester flush each timeseries at a specific point in the `max-chunk-age` cycle. This means multiple replicas of a chunk are very likely to contain the same contents which cuts chunk storage space by up to 66%. Set `-ingester.chunk-age-jitter` to `0` when using this option. If a chunk cache is configured (via `-store.chunks-cache.memcached.hostname`) then duplicate chunk writes are skipped which cuts write IOPs.
 
 - `-ingester.join-after`
 
@@ -300,7 +329,7 @@ It also talks to a KVStore and has it's own copies of the same flags used by the
 
    When `push` requests arrive, pre-allocate this many slots to decode them. Tune this setting to reduce memory allocations and garbage. The optimum value will depend on how many labels are sent with your timeseries samples.
 
-- `-store.chunk-cache-stubs`
+- `-store.chunk-cache.cache-stubs`
 
    Where you don't want to cache every chunk written by ingesters, but you do want to take advantage of chunk write deduplication, this option will make ingesters write a placeholder to the cache for each chunk.
    Make sure you configure ingesters with a different cache to queriers, which need the whole value.
@@ -322,6 +351,17 @@ It also talks to a KVStore and has it's own copies of the same flags used by the
 
 - `-ingester.recover-from-wal`
    Set this to `true` to recover data from an existing WAL. The data is recovered even if WAL is disabled and this is set to `true`. The WAL dir needs to be set for this.
+
+#### Flusher
+
+- `-flusher.wal-dir`
+   Directory where the WAL data should be recovered from.
+
+- `-flusher.concurrent-flushes`
+   Number of concurrent flushes.
+
+- `-flusher.flush-op-timeout`
+   Duration after which a flush should timeout.
 
 ## Runtime Configuration file
 
@@ -417,3 +457,21 @@ Valid per-tenant limits are (with their corresponding flags for default values):
 - `s3.force-path-style`
 
   Set this to `true` to force the request to use path-style addressing (`http://s3.amazonaws.com/BUCKET/KEY`). By default, the S3 client will use virtual hosted bucket addressing when possible (`http://BUCKET.s3.amazonaws.com/KEY`).
+
+## DNS Service Discovery
+
+Some clients in Cortex support service discovery via DNS to find addresses of backend servers to connect to (ie. caching servers). The clients supporting it are:
+
+- [Blocks storage's memcached index cache](../operations/blocks-storage.md#memcached-index-cache)
+- [All caching memcached servers](./config-file-reference.md#memcached-client-config)
+
+### Supported discovery modes
+
+The DNS service discovery, inspired from Thanos DNS SD, supports different discovery modes. A discovery mode is selected adding a specific prefix to the address. The supported prefixes are:
+
+- **`dns+`**<br />
+  The domain name after the prefix is looked up as an A/AAAA query. For example: `dns+memcached.local:11211`
+- **`dnssrv+`**<br />
+  The domain name after the prefix is looked up as a SRV query, and then each SRV record is resolved as an A/AAAA record. For example: `dnssrv+memcached.namespace.svc.cluster.local`
+- **`dnssrvnoa+`**<br />
+  The domain name after the prefix is looked up as a SRV query, with no A/AAAA lookup made after that. For example: `dnssrvnoa+memcached.namespace.svc.cluster.local`

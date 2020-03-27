@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/promql"
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	httpgrpc_server "github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/middleware"
@@ -20,141 +21,76 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/alertmanager"
 	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/chunk/purger"
 	"github.com/cortexproject/cortex/pkg/chunk/storage"
 	"github.com/cortexproject/cortex/pkg/compactor"
 	"github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/configs/db"
 	"github.com/cortexproject/cortex/pkg/distributor"
+	"github.com/cortexproject/cortex/pkg/flusher"
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
+	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/storegateway"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/push"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
+	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
-type moduleName int
+// ModuleName is used to describe a running module
+type ModuleName string
 
 // The various modules that make up Cortex.
 const (
-	Ring moduleName = iota
-	RuntimeConfig
-	Overrides
-	Server
-	Distributor
-	Ingester
-	Querier
-	QuerierChunkStore
-	QueryFrontend
-	Store
-	TableManager
-	Ruler
-	Configs
-	AlertManager
-	Compactor
-	All
+	Ring                ModuleName = "ring"
+	RuntimeConfig       ModuleName = "runtime-config"
+	Overrides           ModuleName = "overrides"
+	Server              ModuleName = "server"
+	Distributor         ModuleName = "distributor"
+	Ingester            ModuleName = "ingester"
+	Flusher             ModuleName = "flusher"
+	Querier             ModuleName = "querier"
+	StoreQueryable      ModuleName = "store-queryable"
+	QueryFrontend       ModuleName = "query-frontend"
+	Store               ModuleName = "store"
+	DeleteRequestsStore ModuleName = "delete-requests-store"
+	TableManager        ModuleName = "table-manager"
+	Ruler               ModuleName = "ruler"
+	Configs             ModuleName = "configs"
+	AlertManager        ModuleName = "alertmanager"
+	Compactor           ModuleName = "compactor"
+	StoreGateway        ModuleName = "store-gateway"
+	MemberlistKV        ModuleName = "memberlist-kv"
+	DataPurger          ModuleName = "data-purger"
+	All                 ModuleName = "all"
 )
 
-func (m moduleName) String() string {
-	switch m {
-	case Ring:
-		return "ring"
-	case RuntimeConfig:
-		return "runtime-config"
-	case Overrides:
-		return "overrides"
-	case Server:
-		return "server"
-	case Distributor:
-		return "distributor"
-	case Store:
-		return "store"
-	case Ingester:
-		return "ingester"
-	case Querier:
-		return "querier"
-	case QuerierChunkStore:
-		return "querier-chunk-store"
-	case QueryFrontend:
-		return "query-frontend"
-	case TableManager:
-		return "table-manager"
-	case Ruler:
-		return "ruler"
-	case Configs:
-		return "configs"
-	case AlertManager:
-		return "alertmanager"
-	case Compactor:
-		return "compactor"
-	case All:
-		return "all"
-	default:
-		panic(fmt.Sprintf("unknown module name: %d", m))
-	}
+func (m ModuleName) String() string {
+	return string(m)
 }
 
-func (m *moduleName) Set(s string) error {
-	switch strings.ToLower(s) {
-	case "ring":
-		*m = Ring
-		return nil
-	case "overrides":
-		*m = Overrides
-		return nil
-	case "server":
-		*m = Server
-		return nil
-	case "distributor":
-		*m = Distributor
-		return nil
-	case "store":
-		*m = Store
-		return nil
-	case "ingester":
-		*m = Ingester
-		return nil
-	case "querier":
-		*m = Querier
-		return nil
-	case "querier-chunk-store":
-		*m = QuerierChunkStore
-		return nil
-	case "query-frontend":
-		*m = QueryFrontend
-		return nil
-	case "table-manager":
-		*m = TableManager
-		return nil
-	case "ruler":
-		*m = Ruler
-		return nil
-	case "configs":
-		*m = Configs
-		return nil
-	case "alertmanager":
-		*m = AlertManager
-		return nil
-	case "compactor":
-		*m = Compactor
-		return nil
-	case "all":
-		*m = All
-		return nil
-	default:
+func (m *ModuleName) Set(s string) error {
+	l := ModuleName(strings.ToLower(s))
+	if _, ok := modules[l]; !ok {
 		return fmt.Errorf("unrecognised module name: %s", s)
 	}
+	*m = l
+	return nil
 }
 
-func (m moduleName) MarshalYAML() (interface{}, error) {
+func (m ModuleName) MarshalYAML() (interface{}, error) {
 	return m.String(), nil
 }
 
-func (m *moduleName) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (m *ModuleName) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return err
@@ -162,28 +98,45 @@ func (m *moduleName) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return m.Set(s)
 }
 
-func (t *Cortex) initServer(cfg *Config) (err error) {
-	t.server, err = server.New(cfg.Server)
-	return
+func (t *Cortex) initServer(cfg *Config) (services.Service, error) {
+	serv, err := server.New(cfg.Server)
+	if err != nil {
+		return nil, err
+	}
+
+	t.server = serv
+
+	servicesToWaitFor := func() []services.Service {
+		svs := []services.Service(nil)
+		for m, s := range t.serviceMap {
+			// Server should not wait for itself.
+			if m != Server {
+				svs = append(svs, s)
+			}
+		}
+		return svs
+	}
+
+	s := NewServerService(t.server, servicesToWaitFor)
+	serv.HTTP.HandleFunc("/", indexHandler)
+	serv.HTTP.HandleFunc("/config", configHandler(cfg))
+
+	return s, nil
 }
 
-func (t *Cortex) stopServer() (err error) {
-	t.server.Shutdown()
-	return
-}
-
-func (t *Cortex) initRing(cfg *Config) (err error) {
+func (t *Cortex) initRing(cfg *Config) (serv services.Service, err error) {
 	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.Multi.ConfigProvider = multiClientRuntimeConfigChannel(t.runtimeConfig)
+	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
 	t.ring, err = ring.New(cfg.Ingester.LifecyclerConfig.RingConfig, "ingester", ring.IngesterRingKey)
 	if err != nil {
-		return
+		return nil, err
 	}
 	prometheus.MustRegister(t.ring)
 	t.server.HTTP.Handle("/ring", t.ring)
-	return
+	return t.ring, nil
 }
 
-func (t *Cortex) initRuntimeConfig(cfg *Config) (err error) {
+func (t *Cortex) initRuntimeConfig(cfg *Config) (services.Service, error) {
 	if cfg.RuntimeConfig.LoadPath == "" {
 		cfg.RuntimeConfig.LoadPath = cfg.LimitsConfig.PerTenantOverrideConfig
 		cfg.RuntimeConfig.ReloadPeriod = cfg.LimitsConfig.PerTenantOverridePeriod
@@ -193,22 +146,21 @@ func (t *Cortex) initRuntimeConfig(cfg *Config) (err error) {
 	// make sure to set default limits before we start loading configuration into memory
 	validation.SetDefaultLimitsForYAMLUnmarshalling(cfg.LimitsConfig)
 
-	t.runtimeConfig, err = runtimeconfig.NewRuntimeConfigManager(cfg.RuntimeConfig)
-	return err
+	serv, err := runtimeconfig.NewRuntimeConfigManager(cfg.RuntimeConfig, prometheus.DefaultRegisterer)
+	t.runtimeConfig = serv
+	return serv, err
 }
 
-func (t *Cortex) stopRuntimeConfig() (err error) {
-	t.runtimeConfig.Stop()
-	return nil
-}
-
-func (t *Cortex) initOverrides(cfg *Config) (err error) {
+func (t *Cortex) initOverrides(cfg *Config) (serv services.Service, err error) {
 	t.overrides, err = validation.NewOverrides(cfg.LimitsConfig, tenantLimitsFromRuntimeConfig(t.runtimeConfig))
-	return err
+	// overrides don't have operational state, nor do they need to do anything more in starting/stopping phase,
+	// so there is no need to return any service.
+	return nil, err
 }
 
-func (t *Cortex) initDistributor(cfg *Config) (err error) {
+func (t *Cortex) initDistributor(cfg *Config) (serv services.Service, err error) {
 	cfg.Distributor.DistributorRing.ListenPort = cfg.Server.GRPCListenPort
+	cfg.Distributor.DistributorRing.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
 
 	// Check whether the distributor can join the distributors ring, which is
 	// whenever it's not running as an internal dependency (ie. querier or
@@ -221,18 +173,21 @@ func (t *Cortex) initDistributor(cfg *Config) (err error) {
 	}
 
 	t.server.HTTP.HandleFunc("/all_user_stats", t.distributor.AllUserStatsHandler)
-	t.server.HTTP.Handle("/api/prom/push", t.httpAuthMiddleware.Wrap(http.HandlerFunc(t.distributor.PushHandler)))
+	t.server.HTTP.Handle("/api/prom/push", t.httpAuthMiddleware.Wrap(push.Handler(cfg.Distributor, t.distributor.Push)))
 	t.server.HTTP.Handle("/ha-tracker", t.distributor.Replicas)
-	return
+	return t.distributor, nil
 }
 
-func (t *Cortex) stopDistributor() (err error) {
-	t.distributor.Stop()
-	return nil
-}
+func (t *Cortex) initQuerier(cfg *Config) (serv services.Service, err error) {
+	var tombstonesLoader *purger.TombstonesLoader
+	if cfg.DataPurgerConfig.Enable {
+		tombstonesLoader = purger.NewTombstonesLoader(t.deletesStore)
+	} else {
+		// until we need to explicitly enable delete series support we need to do create TombstonesLoader without DeleteStore which acts as noop
+		tombstonesLoader = purger.NewTombstonesLoader(nil)
+	}
 
-func (t *Cortex) initQuerier(cfg *Config) (err error) {
-	queryable, engine := querier.New(cfg.Querier, t.distributor, t.querierChunkStore)
+	queryable, engine := querier.New(cfg.Querier, t.distributor, t.storeQueryable, tombstonesLoader, prometheus.DefaultRegisterer)
 	api := v1.NewAPI(
 		engine,
 		queryable,
@@ -254,58 +209,56 @@ func (t *Cortex) initQuerier(cfg *Config) (err error) {
 	api.Register(promRouter)
 
 	subrouter := t.server.HTTP.PathPrefix("/api/prom").Subrouter()
-	subrouter.PathPrefix("/api/v1").Handler(t.httpAuthMiddleware.Wrap(promRouter))
+	subrouter.PathPrefix("/api/v1").Handler(fakeRemoteAddr(t.httpAuthMiddleware.Wrap(promRouter)))
 	subrouter.Path("/read").Handler(t.httpAuthMiddleware.Wrap(querier.RemoteReadHandler(queryable)))
-	subrouter.Path("/validate_expr").Handler(t.httpAuthMiddleware.Wrap(http.HandlerFunc(t.distributor.ValidateExprHandler)))
 	subrouter.Path("/chunks").Handler(t.httpAuthMiddleware.Wrap(querier.ChunksHandler(queryable)))
 	subrouter.Path("/user_stats").Handler(middleware.AuthenticateUser.Wrap(http.HandlerFunc(t.distributor.UserStatsHandler)))
 
-	// Start the query frontend worker once the query engine and the store
-	// have been successfully initialized.
-	t.worker, err = frontend.NewWorker(cfg.Worker, httpgrpc_server.NewServer(t.server.HTTPServer.Handler), util.Logger)
+	// Query frontend worker will only be started after all its dependencies are started, not here.
+	// Worker may also be nil, if not configured, which is OK.
+	worker, err := frontend.NewWorker(cfg.Worker, httpgrpc_server.NewServer(t.server.HTTPServer.Handler), util.Logger)
 	if err != nil {
 		return
 	}
 
-	// Once the execution reaches this point, all synchronous initialization has been
-	// done and the querier is ready to serve queries, so we're just returning a 202.
-	t.server.HTTP.Path("/ready").Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	return
+	return worker, nil
 }
 
-func (t *Cortex) stopQuerier() error {
-	t.worker.Stop()
-	return nil
+// Latest Prometheus requires r.RemoteAddr to be set to addr:port, otherwise it reject the request.
+// Requests to Querier sometimes doesn't have that (if they are fetched from Query-Frontend).
+// Prometheus uses this when logging queries to QueryLogger, but Cortex doesn't call engine.SetQueryLogger to set one.
+//
+// Can be removed when (if) https://github.com/prometheus/prometheus/pull/6840 is merged.
+func fakeRemoteAddr(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RemoteAddr == "" {
+			r.RemoteAddr = "127.0.0.1:8888"
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
 
-func (t *Cortex) initQuerierChunkStore(cfg *Config) error {
+func (t *Cortex) initStoreQueryable(cfg *Config) (services.Service, error) {
 	if cfg.Storage.Engine == storage.StorageEngineChunks {
-		t.querierChunkStore = t.store
-		return nil
+		t.storeQueryable = querier.NewChunkStoreQueryable(cfg.Querier, t.store)
+		return nil, nil
 	}
 
 	if cfg.Storage.Engine == storage.StorageEngineTSDB {
-		store, err := querier.NewBlockQuerier(cfg.TSDB, cfg.Server.LogLevel, prometheus.DefaultRegisterer)
+		storeQueryable, err := querier.NewBlockQueryable(cfg.TSDB, cfg.Server.LogLevel, prometheus.DefaultRegisterer)
 		if err != nil {
-			return err
+			return nil, err
 		}
-
-		t.querierChunkStore = store
-		return nil
+		t.storeQueryable = storeQueryable
+		return storeQueryable, nil
 	}
 
-	return fmt.Errorf("unknown storage engine '%s'", cfg.Storage.Engine)
+	return nil, fmt.Errorf("unknown storage engine '%s'", cfg.Storage.Engine)
 }
 
-func (t *Cortex) stopQuerierChunkStore() error {
-	return nil
-}
-
-func (t *Cortex) initIngester(cfg *Config) (err error) {
+func (t *Cortex) initIngester(cfg *Config) (serv services.Service, err error) {
 	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.Multi.ConfigProvider = multiClientRuntimeConfigChannel(t.runtimeConfig)
+	cfg.Ingester.LifecyclerConfig.RingConfig.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
 	cfg.Ingester.LifecyclerConfig.ListenPort = &cfg.Server.GRPCListenPort
 	cfg.Ingester.TSDBEnabled = cfg.Storage.Engine == storage.StorageEngineTSDB
 	cfg.Ingester.TSDBConfig = cfg.TSDB
@@ -318,20 +271,30 @@ func (t *Cortex) initIngester(cfg *Config) (err error) {
 
 	client.RegisterIngesterServer(t.server.GRPC, t.ingester)
 	grpc_health_v1.RegisterHealthServer(t.server.GRPC, t.ingester)
-	t.server.HTTP.Path("/ready").Handler(http.HandlerFunc(t.ingester.ReadinessHandler))
 	t.server.HTTP.Path("/flush").Handler(http.HandlerFunc(t.ingester.FlushHandler))
 	t.server.HTTP.Path("/shutdown").Handler(http.HandlerFunc(t.ingester.ShutdownHandler))
-	return
+	t.server.HTTP.Handle("/push", t.httpAuthMiddleware.Wrap(push.Handler(cfg.Distributor, t.ingester.Push)))
+	return t.ingester, nil
 }
 
-func (t *Cortex) stopIngester() error {
-	t.ingester.Shutdown()
-	return nil
+func (t *Cortex) initFlusher(cfg *Config) (serv services.Service, err error) {
+	t.flusher, err = flusher.New(
+		cfg.Flusher,
+		cfg.Ingester,
+		cfg.IngesterClient,
+		t.store,
+		prometheus.DefaultRegisterer,
+	)
+	if err != nil {
+		return
+	}
+
+	return t.flusher, nil
 }
 
-func (t *Cortex) initStore(cfg *Config) (err error) {
+func (t *Cortex) initStore(cfg *Config) (serv services.Service, err error) {
 	if cfg.Storage.Engine == storage.StorageEngineTSDB {
-		return nil
+		return nil, nil
 	}
 	err = cfg.Schema.Load()
 	if err != nil {
@@ -339,24 +302,67 @@ func (t *Cortex) initStore(cfg *Config) (err error) {
 	}
 
 	t.store, err = storage.NewStore(cfg.Storage, cfg.ChunkStore, cfg.Schema, t.overrides)
-	return
-}
-
-func (t *Cortex) stopStore() error {
-	if t.store != nil {
-		t.store.Stop()
-	}
-	return nil
-}
-
-func (t *Cortex) initQueryFrontend(cfg *Config) (err error) {
-	t.frontend, err = frontend.New(cfg.Frontend, util.Logger)
 	if err != nil {
 		return
 	}
-	tripperware, cache, err := queryrange.NewTripperware(cfg.QueryRange, util.Logger, t.overrides, queryrange.PrometheusCodec, queryrange.PrometheusResponseExtractor)
+
+	return services.NewIdleService(nil, func(_ error) error {
+		t.store.Stop()
+		return nil
+	}), nil
+}
+
+func (t *Cortex) initDeleteRequestsStore(cfg *Config) (serv services.Service, err error) {
+	if !cfg.DataPurgerConfig.Enable {
+		return
+	}
+
+	var indexClient chunk.IndexClient
+	indexClient, err = storage.NewIndexClient(cfg.Storage.DeleteStoreConfig.Store, cfg.Storage, cfg.Schema)
 	if err != nil {
-		return err
+		return
+	}
+
+	t.deletesStore, err = purger.NewDeleteStore(cfg.Storage.DeleteStoreConfig, indexClient)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (t *Cortex) initQueryFrontend(cfg *Config) (serv services.Service, err error) {
+	// Load the schema only if sharded queries is set.
+	if cfg.QueryRange.ShardedQueries {
+		err = cfg.Schema.Load()
+		if err != nil {
+			return
+		}
+	}
+
+	t.frontend, err = frontend.New(cfg.Frontend, util.Logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		return
+	}
+	tripperware, cache, err := queryrange.NewTripperware(
+		cfg.QueryRange,
+		util.Logger,
+		t.overrides,
+		queryrange.PrometheusCodec,
+		queryrange.PrometheusResponseExtractor,
+		cfg.Schema,
+		promql.EngineOpts{
+			Logger:     util.Logger,
+			Reg:        prometheus.DefaultRegisterer,
+			MaxSamples: cfg.Querier.MaxSamples,
+			Timeout:    cfg.Querier.Timeout,
+		},
+		cfg.Querier.QueryIngestersWithin,
+		prometheus.DefaultRegisterer,
+	)
+
+	if err != nil {
+		return nil, err
 	}
 	t.cache = cache
 	t.frontend.Wrap(tripperware)
@@ -367,26 +373,24 @@ func (t *Cortex) initQueryFrontend(cfg *Config) (err error) {
 			t.frontend.Handler(),
 		),
 	)
-	return
+	return services.NewIdleService(nil, func(_ error) error {
+		t.frontend.Close()
+		if t.cache != nil {
+			t.cache.Stop()
+			t.cache = nil
+		}
+		return nil
+	}), nil
 }
 
-func (t *Cortex) stopQueryFrontend() (err error) {
-	t.frontend.Close()
-	if t.cache != nil {
-		t.cache.Stop()
-		t.cache = nil
-	}
-	return
-}
-
-func (t *Cortex) initTableManager(cfg *Config) error {
+func (t *Cortex) initTableManager(cfg *Config) (services.Service, error) {
 	if cfg.Storage.Engine == storage.StorageEngineTSDB {
-		return nil // table manager isn't used in v2
+		return nil, nil // table manager isn't used in v2
 	}
 
 	err := cfg.Schema.Load()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Assume the newest config is the one to use
@@ -407,192 +411,256 @@ func (t *Cortex) initTableManager(cfg *Config) error {
 
 	tableClient, err := storage.NewTableClient(lastConfig.IndexType, cfg.Storage)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	bucketClient, err := storage.NewBucketClient(cfg.Storage)
 	util.CheckFatal("initializing bucket client", err)
 
-	t.tableManager, err = chunk.NewTableManager(cfg.TableManager, cfg.Schema, cfg.Ingester.MaxChunkAge, tableClient, bucketClient)
-	if err != nil {
-		return err
-	}
-	t.tableManager.Start()
-	return nil
+	t.tableManager, err = chunk.NewTableManager(cfg.TableManager, cfg.Schema, cfg.Ingester.MaxChunkAge, tableClient, bucketClient, prometheus.DefaultRegisterer)
+	return t.tableManager, err
 }
 
-func (t *Cortex) stopTableManager() error {
-	if t.tableManager != nil {
-		t.tableManager.Stop()
+func (t *Cortex) initRuler(cfg *Config) (serv services.Service, err error) {
+	var tombstonesLoader *purger.TombstonesLoader
+	if cfg.DataPurgerConfig.Enable {
+		tombstonesLoader = purger.NewTombstonesLoader(t.deletesStore)
+	} else {
+		// until we need to explicitly enable delete series support we need to do create TombstonesLoader without DeleteStore which acts as noop
+		tombstonesLoader = purger.NewTombstonesLoader(nil)
 	}
 
-	return nil
-}
-
-func (t *Cortex) initRuler(cfg *Config) (err error) {
 	cfg.Ruler.Ring.ListenPort = cfg.Server.GRPCListenPort
-	queryable, engine := querier.New(cfg.Querier, t.distributor, t.querierChunkStore)
+	cfg.Ruler.Ring.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
+	queryable, engine := querier.New(cfg.Querier, t.distributor, t.storeQueryable, tombstonesLoader, prometheus.DefaultRegisterer)
 
 	t.ruler, err = ruler.NewRuler(cfg.Ruler, engine, queryable, t.distributor, prometheus.DefaultRegisterer, util.Logger)
-	if err != nil {
-		return err
-	}
-
-	if cfg.Ruler.EnableAPI {
-		subrouter := t.server.HTTP.PathPrefix(cfg.HTTPPrefix).Subrouter()
-		t.ruler.RegisterRoutes(subrouter)
-		ruler.RegisterRulerServer(t.server.GRPC, t.ruler)
-	}
-
-	t.server.HTTP.Handle("/ruler_ring", t.ruler)
-	return
-}
-
-func (t *Cortex) stopRuler() error {
-	t.ruler.Stop()
-	return nil
-}
-
-func (t *Cortex) initConfigs(cfg *Config) (err error) {
-	t.configDB, err = db.New(cfg.ConfigDB)
 	if err != nil {
 		return
 	}
 
-	t.configAPI = api.New(t.configDB)
-	t.configAPI.RegisterRoutes(t.server.HTTP)
-	return
-}
-
-func (t *Cortex) stopConfigs() error {
-	t.configDB.Close()
-	return nil
-}
-
-func (t *Cortex) initAlertmanager(cfg *Config) (err error) {
-	t.alertmanager, err = alertmanager.NewMultitenantAlertmanager(&cfg.Alertmanager, cfg.ConfigStore)
-	if err != nil {
-		return err
+	if cfg.Ruler.EnableAPI {
+		subrouter := t.server.HTTP.PathPrefix(cfg.HTTPPrefix).Subrouter()
+		t.ruler.RegisterRoutes(subrouter, t.httpAuthMiddleware)
+		ruler.RegisterRulerServer(t.server.GRPC, t.ruler)
 	}
-	go t.alertmanager.Run()
 
+	t.server.HTTP.Handle("/ruler_ring", t.ruler)
+	return t.ruler, nil
+}
+
+func (t *Cortex) initConfig(cfg *Config) (serv services.Service, err error) {
+	t.configDB, err = db.New(cfg.Configs.DB)
+	if err != nil {
+		return
+	}
+
+	t.configAPI = api.New(t.configDB, cfg.Configs.API)
+	t.configAPI.RegisterRoutes(t.server.HTTP)
+	return services.NewIdleService(nil, func(_ error) error {
+		t.configDB.Close()
+		return nil
+	}), nil
+}
+
+func (t *Cortex) initAlertManager(cfg *Config) (serv services.Service, err error) {
+	t.alertmanager, err = alertmanager.NewMultitenantAlertmanager(&cfg.Alertmanager, util.Logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		return
+	}
 	t.server.HTTP.PathPrefix("/status").Handler(t.alertmanager.GetStatusHandler())
 
 	// TODO this clashed with the queirer and the distributor, so we cannot
 	// run them in the same process.
 	t.server.HTTP.PathPrefix("/api/prom").Handler(middleware.AuthenticateUser.Wrap(t.alertmanager))
-	return
+	return t.alertmanager, nil
 }
 
-func (t *Cortex) stopAlertmanager() error {
-	t.alertmanager.Stop()
-	return nil
-}
+func (t *Cortex) initCompactor(cfg *Config) (serv services.Service, err error) {
+	cfg.Compactor.ShardingRing.ListenPort = cfg.Server.GRPCListenPort
+	cfg.Compactor.ShardingRing.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
 
-func (t *Cortex) initCompactor(cfg *Config) (err error) {
 	t.compactor, err = compactor.NewCompactor(cfg.Compactor, cfg.TSDB, util.Logger, prometheus.DefaultRegisterer)
-	return err
+	if err != nil {
+		return
+	}
+
+	// Expose HTTP endpoints.
+	t.server.HTTP.HandleFunc("/compactor/ring", t.compactor.RingHandler)
+
+	return t.compactor, nil
 }
 
-func (t *Cortex) stopCompactor() error {
-	t.compactor.Shutdown()
-	return nil
+func (t *Cortex) initStoreGateway(cfg *Config) (serv services.Service, err error) {
+	if cfg.Storage.Engine != storage.StorageEngineTSDB {
+		return nil, nil
+	}
+
+	cfg.StoreGateway.ShardingRing.ListenPort = cfg.Server.GRPCListenPort
+	cfg.StoreGateway.ShardingRing.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
+
+	t.storeGateway = storegateway.NewStoreGateway(cfg.StoreGateway, cfg.TSDB, util.Logger, prometheus.DefaultRegisterer)
+
+	// Expose HTTP endpoints.
+	t.server.HTTP.HandleFunc("/store-gateway/ring", t.storeGateway.RingHandler)
+
+	return t.storeGateway, nil
+}
+
+func (t *Cortex) initMemberlistKV(cfg *Config) (services.Service, error) {
+	cfg.MemberlistKV.MetricsRegisterer = prometheus.DefaultRegisterer
+	cfg.MemberlistKV.Codecs = []codec.Codec{
+		ring.GetCodec(),
+	}
+	t.memberlistKV = memberlist.NewKVInit(&cfg.MemberlistKV)
+
+	return services.NewIdleService(nil, func(_ error) error {
+		t.memberlistKV.Stop()
+		return nil
+	}), nil
+}
+
+func (t *Cortex) initDataPurger(cfg *Config) (services.Service, error) {
+	if !cfg.DataPurgerConfig.Enable {
+		return nil, nil
+	}
+
+	storageClient, err := storage.NewObjectClient(cfg.DataPurgerConfig.ObjectStoreType, cfg.Storage)
+	if err != nil {
+		return nil, err
+	}
+
+	t.dataPurger, err = purger.NewDataPurger(cfg.DataPurgerConfig, t.deletesStore, t.store, storageClient)
+	if err != nil {
+		return nil, err
+	}
+
+	var deleteRequestHandler *purger.DeleteRequestHandler
+	deleteRequestHandler, err = purger.NewDeleteRequestHandler(t.deletesStore)
+	if err != nil {
+		return nil, err
+	}
+
+	adminRouter := t.server.HTTP.PathPrefix(cfg.HTTPPrefix + "/api/v1/admin/tsdb").Subrouter()
+
+	adminRouter.Path("/delete_series").Methods("PUT", "POST").Handler(t.httpAuthMiddleware.Wrap(http.HandlerFunc(deleteRequestHandler.AddDeleteRequestHandler)))
+	adminRouter.Path("/delete_series").Methods("GET").Handler(t.httpAuthMiddleware.Wrap(http.HandlerFunc(deleteRequestHandler.GetAllDeleteRequestsHandler)))
+
+	return t.dataPurger, nil
 }
 
 type module struct {
-	deps []moduleName
-	init func(t *Cortex, cfg *Config) error
-	stop func(t *Cortex) error
+	deps []ModuleName
+
+	// service for this module (can return nil)
+	service func(t *Cortex, cfg *Config) (services.Service, error)
+
+	// service that will be wrapped into moduleServiceWrapper, to wait for dependencies to start / end
+	// (can return nil)
+	wrappedService func(t *Cortex, cfg *Config) (services.Service, error)
 }
 
-var modules = map[moduleName]module{
+var modules = map[ModuleName]module{
 	Server: {
-		init: (*Cortex).initServer,
-		stop: (*Cortex).stopServer,
+		// we cannot use 'wrappedService', as stopped Server service is currently a signal to Cortex
+		// that it should shutdown. If we used wrappedService, it wouldn't stop until
+		// all services that depend on it stopped first... but there is nothing that would make them stop.
+		service: (*Cortex).initServer,
 	},
 
 	RuntimeConfig: {
-		init: (*Cortex).initRuntimeConfig,
-		stop: (*Cortex).stopRuntimeConfig,
+		wrappedService: (*Cortex).initRuntimeConfig,
+	},
+
+	MemberlistKV: {
+		wrappedService: (*Cortex).initMemberlistKV,
 	},
 
 	Ring: {
-		deps: []moduleName{Server, RuntimeConfig},
-		init: (*Cortex).initRing,
+		deps:           []ModuleName{Server, RuntimeConfig, MemberlistKV},
+		wrappedService: (*Cortex).initRing,
 	},
 
 	Overrides: {
-		deps: []moduleName{RuntimeConfig},
-		init: (*Cortex).initOverrides,
+		deps:           []ModuleName{RuntimeConfig},
+		wrappedService: (*Cortex).initOverrides,
 	},
 
 	Distributor: {
-		deps: []moduleName{Ring, Server, Overrides},
-		init: (*Cortex).initDistributor,
-		stop: (*Cortex).stopDistributor,
+		deps:           []ModuleName{Ring, Server, Overrides},
+		wrappedService: (*Cortex).initDistributor,
 	},
 
 	Store: {
-		deps: []moduleName{Overrides},
-		init: (*Cortex).initStore,
-		stop: (*Cortex).stopStore,
+		deps:           []ModuleName{Overrides},
+		wrappedService: (*Cortex).initStore,
+	},
+
+	DeleteRequestsStore: {
+		wrappedService: (*Cortex).initDeleteRequestsStore,
 	},
 
 	Ingester: {
-		deps: []moduleName{Overrides, Store, Server, RuntimeConfig},
-		init: (*Cortex).initIngester,
-		stop: (*Cortex).stopIngester,
+		deps:           []ModuleName{Overrides, Store, Server, RuntimeConfig, MemberlistKV},
+		wrappedService: (*Cortex).initIngester,
+	},
+
+	Flusher: {
+		deps:           []ModuleName{Store, Server},
+		wrappedService: (*Cortex).initFlusher,
 	},
 
 	Querier: {
-		deps: []moduleName{Distributor, Store, Ring, Server, QuerierChunkStore},
-		init: (*Cortex).initQuerier,
-		stop: (*Cortex).stopQuerier,
+		deps:           []ModuleName{Distributor, Store, Ring, Server, StoreQueryable},
+		wrappedService: (*Cortex).initQuerier,
 	},
 
-	QuerierChunkStore: {
-		deps: []moduleName{Store},
-		init: (*Cortex).initQuerierChunkStore,
-		stop: (*Cortex).stopQuerierChunkStore,
+	StoreQueryable: {
+		deps:           []ModuleName{Store, DeleteRequestsStore},
+		wrappedService: (*Cortex).initStoreQueryable,
 	},
 
 	QueryFrontend: {
-		deps: []moduleName{Server, Overrides},
-		init: (*Cortex).initQueryFrontend,
-		stop: (*Cortex).stopQueryFrontend,
+		deps:           []ModuleName{Server, Overrides},
+		wrappedService: (*Cortex).initQueryFrontend,
 	},
 
 	TableManager: {
-		deps: []moduleName{Server},
-		init: (*Cortex).initTableManager,
-		stop: (*Cortex).stopTableManager,
+		deps:           []ModuleName{Server},
+		wrappedService: (*Cortex).initTableManager,
 	},
 
 	Ruler: {
-		deps: []moduleName{Distributor, Store, QuerierChunkStore},
-		init: (*Cortex).initRuler,
-		stop: (*Cortex).stopRuler,
+		deps:           []ModuleName{Distributor, Store, StoreQueryable},
+		wrappedService: (*Cortex).initRuler,
 	},
 
 	Configs: {
-		deps: []moduleName{Server},
-		init: (*Cortex).initConfigs,
-		stop: (*Cortex).stopConfigs,
+		deps:           []ModuleName{Server},
+		wrappedService: (*Cortex).initConfig,
 	},
 
 	AlertManager: {
-		deps: []moduleName{Server},
-		init: (*Cortex).initAlertmanager,
-		stop: (*Cortex).stopAlertmanager,
+		deps:           []ModuleName{Server},
+		wrappedService: (*Cortex).initAlertManager,
 	},
 
 	Compactor: {
-		deps: []moduleName{Server},
-		init: (*Cortex).initCompactor,
-		stop: (*Cortex).stopCompactor,
+		deps:           []ModuleName{Server},
+		wrappedService: (*Cortex).initCompactor,
+	},
+
+	StoreGateway: {
+		deps:           []ModuleName{Server},
+		wrappedService: (*Cortex).initStoreGateway,
+	},
+
+	DataPurger: {
+		deps:           []ModuleName{Store, DeleteRequestsStore, Server},
+		wrappedService: (*Cortex).initDataPurger,
 	},
 
 	All: {
-		deps: []moduleName{Querier, Ingester, Distributor, TableManager},
+		deps: []ModuleName{Querier, Ingester, Distributor, TableManager, DataPurger, StoreGateway},
 	},
 }

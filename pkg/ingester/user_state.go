@@ -11,7 +11,6 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/segmentio/fasthash/fnv1a"
-
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 
@@ -48,6 +47,7 @@ type userState struct {
 	memSeriesCreatedTotal prometheus.Counter
 	memSeriesRemovedTotal prometheus.Counter
 	discardedSamples      *prometheus.CounterVec
+	createdChunks         prometheus.Counter
 }
 
 const metricCounterShards = 128
@@ -80,6 +80,7 @@ func (us *userStates) cp() map[string]*userState {
 	return states
 }
 
+//nolint:unused
 func (us *userStates) gc() {
 	us.states.Range(func(key, value interface{}) bool {
 		state := value.(*userState)
@@ -135,6 +136,7 @@ func (us *userStates) getOrCreate(userID string) *userState {
 			memSeriesCreatedTotal: us.metrics.memSeriesCreatedTotal.WithLabelValues(userID),
 			memSeriesRemovedTotal: us.metrics.memSeriesRemovedTotal.WithLabelValues(userID),
 			discardedSamples:      validation.DiscardedSamples.MustCurryWith(prometheus.Labels{"user": userID}),
+			createdChunks:         us.metrics.createdChunks,
 		}
 		state.mapper = newFPMapper(state.fpToSeries)
 		stored, ok := us.states.LoadOrStore(userID, state)
@@ -156,12 +158,17 @@ func (us *userStates) getViaContext(ctx context.Context) (*userState, bool, erro
 	return state, ok, nil
 }
 
+// NOTE: memory for `labels` is unsafe; anything retained beyond the
+// life of this function must be copied
 func (us *userStates) getOrCreateSeries(ctx context.Context, userID string, labels []client.LabelAdapter, record *Record) (*userState, model.Fingerprint, *memorySeries, error) {
 	state := us.getOrCreate(userID)
+	// WARNING: `err` may have a reference to unsafe memory in `labels`
 	fp, series, err := state.getSeries(labels, record)
 	return state, fp, series, err
 }
 
+// NOTE: memory for `metric` is unsafe; anything retained beyond the
+// life of this function must be copied
 func (u *userState) getSeries(metric labelPairs, record *Record) (model.Fingerprint, *memorySeries, error) {
 	rawFP := client.FastFingerprint(metric)
 	u.fpLocker.Lock(rawFP)
@@ -198,6 +205,7 @@ func (u *userState) createSeriesWithFingerprint(fp model.Fingerprint, metric lab
 		}
 	}
 
+	// MetricNameFromLabelAdapters returns a copy of the string in `metric`
 	metricName, err := extract.MetricNameFromLabelAdapters(metric)
 	if err != nil {
 		return nil, err
@@ -206,6 +214,7 @@ func (u *userState) createSeriesWithFingerprint(fp model.Fingerprint, metric lab
 	if !recovery {
 		// Check if the per-metric limit has been exceeded
 		if err = u.canAddSeriesFor(string(metricName)); err != nil {
+			// WARNING: returns a reference to `metric`
 			return nil, makeMetricLimitError(perMetricSeriesLimit, client.FromLabelAdaptersToLabels(metric), err)
 		}
 	}
@@ -220,8 +229,8 @@ func (u *userState) createSeriesWithFingerprint(fp model.Fingerprint, metric lab
 		})
 	}
 
-	labels := u.index.Add(metric, fp)
-	series := newMemorySeries(labels)
+	labels := u.index.Add(metric, fp) // Add() returns 'interned' values so the original labels are not retained
+	series := newMemorySeries(labels, u.createdChunks)
 	u.fpToSeries.put(fp, series)
 
 	return series, nil

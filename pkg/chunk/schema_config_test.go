@@ -7,6 +7,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func TestHourlyBuckets(t *testing.T) {
@@ -35,10 +36,11 @@ func TestHourlyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(0),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   0,
-				tableName: "table",
-				hashKey:   "0:0",
+				from:       0,
+				through:    0,
+				tableName:  "table",
+				hashKey:    "0:0",
+				bucketSize: uint32(millisecondsInHour),
 			}},
 		},
 		{
@@ -48,10 +50,11 @@ func TestHourlyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(1800),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   1800 * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:0",
+				from:       0,
+				through:    1800 * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:0",
+				bucketSize: uint32(millisecondsInHour),
 			}},
 		},
 		{
@@ -61,15 +64,17 @@ func TestHourlyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(3600),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   3600 * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:0",
+				from:       0,
+				through:    3600 * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:0",
+				bucketSize: uint32(millisecondsInHour),
 			}, {
-				from:      0,
-				through:   0, // ms
-				tableName: "table",
-				hashKey:   "0:1",
+				from:       0,
+				through:    0, // ms
+				tableName:  "table",
+				hashKey:    "0:1",
+				bucketSize: uint32(millisecondsInHour),
 			}},
 		},
 		{
@@ -79,20 +84,23 @@ func TestHourlyBuckets(t *testing.T) {
 				through: model.TimeFromUnix((2 * 3600) + 1800),
 			},
 			[]Bucket{{
-				from:      900 * 1000,  // ms
-				through:   3600 * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:0",
+				from:       900 * 1000,  // ms
+				through:    3600 * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:0",
+				bucketSize: uint32(millisecondsInHour),
 			}, {
-				from:      0,
-				through:   3600 * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:1",
+				from:       0,
+				through:    3600 * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:1",
+				bucketSize: uint32(millisecondsInHour),
 			}, {
-				from:      0,
-				through:   1800 * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:2",
+				from:       0,
+				through:    1800 * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:2",
+				bucketSize: uint32(millisecondsInHour),
 			}},
 		},
 	}
@@ -130,10 +138,11 @@ func TestDailyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(0),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   0,
-				tableName: "table",
-				hashKey:   "0:d0",
+				from:       0,
+				through:    0,
+				tableName:  "table",
+				hashKey:    "0:d0",
+				bucketSize: uint32(millisecondsInDay),
 			}},
 		},
 		{
@@ -143,10 +152,11 @@ func TestDailyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(6 * 3600),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   (6 * 3600) * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:d0",
+				from:       0,
+				through:    (6 * 3600) * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:d0",
+				bucketSize: uint32(millisecondsInDay),
 			}},
 		},
 		{
@@ -156,15 +166,17 @@ func TestDailyBuckets(t *testing.T) {
 				through: model.TimeFromUnix(24 * 3600),
 			},
 			[]Bucket{{
-				from:      0,
-				through:   (24 * 3600) * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:d0",
+				from:       0,
+				through:    (24 * 3600) * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:d0",
+				bucketSize: uint32(millisecondsInDay),
 			}, {
-				from:      0,
-				through:   0,
-				tableName: "table",
-				hashKey:   "0:d1",
+				from:       0,
+				through:    0,
+				tableName:  "table",
+				hashKey:    "0:d1",
+				bucketSize: uint32(millisecondsInDay),
 			}},
 		},
 		{
@@ -174,20 +186,23 @@ func TestDailyBuckets(t *testing.T) {
 				through: model.TimeFromUnix((2 * 24 * 3600) + (12 * 3600)),
 			},
 			[]Bucket{{
-				from:      (6 * 3600) * 1000,  // ms
-				through:   (24 * 3600) * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:d0",
+				from:       (6 * 3600) * 1000,  // ms
+				through:    (24 * 3600) * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:d0",
+				bucketSize: uint32(millisecondsInDay),
 			}, {
-				from:      0,
-				through:   (24 * 3600) * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:d1",
+				from:       0,
+				through:    (24 * 3600) * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:d1",
+				bucketSize: uint32(millisecondsInDay),
 			}, {
-				from:      0,
-				through:   (12 * 3600) * 1000, // ms
-				tableName: "table",
-				hashKey:   "0:d2",
+				from:       0,
+				through:    (12 * 3600) * 1000, // ms
+				tableName:  "table",
+				hashKey:    "0:d2",
+				bucketSize: uint32(millisecondsInDay),
 			}},
 		},
 	}
@@ -293,11 +308,12 @@ func TestSchemaConfig_Validate(t *testing.T) {
 
 	tests := map[string]struct {
 		config   *SchemaConfig
-		expected error
+		expected *SchemaConfig
+		err      error
 	}{
 		"should pass the default config (ie. used cortex runs with a target not requiring the schema config)": {
-			config:   &SchemaConfig{},
-			expected: nil,
+			config: &SchemaConfig{},
+			err:    nil,
 		},
 		"should fail on invalid schema version": {
 			config: &SchemaConfig{
@@ -305,7 +321,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					{Schema: "v0"},
 				},
 			},
-			expected: errInvalidSchemaVersion,
+			err: errInvalidSchemaVersion,
 		},
 		"should fail on index table period not multiple of 1h for schema v1": {
 			config: &SchemaConfig{
@@ -316,7 +332,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: errInvalidTablePeriod,
+			err: errInvalidTablePeriod,
 		},
 		"should fail on chunk table period not multiple of 1h for schema v1": {
 			config: &SchemaConfig{
@@ -328,7 +344,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: errInvalidTablePeriod,
+			err: errInvalidTablePeriod,
 		},
 		"should pass on index and chunk table period multiple of 1h for schema v1": {
 			config: &SchemaConfig{
@@ -340,7 +356,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			err: nil,
 		},
 		"should fail on index table period not multiple of 24h for schema v10": {
 			config: &SchemaConfig{
@@ -351,7 +367,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: errInvalidTablePeriod,
+			err: errInvalidTablePeriod,
 		},
 		"should fail on chunk table period not multiple of 24h for schema v10": {
 			config: &SchemaConfig{
@@ -363,7 +379,7 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: errInvalidTablePeriod,
+			err: errInvalidTablePeriod,
 		},
 		"should pass on index and chunk table period multiple of 24h for schema v10": {
 			config: &SchemaConfig{
@@ -375,7 +391,17 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			expected: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						RowShards:   16,
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+						ChunkTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: nil,
 		},
 		"should pass on index and chunk table period set to zero (no period tables)": {
 			config: &SchemaConfig{
@@ -387,7 +413,54 @@ func TestSchemaConfig_Validate(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			expected: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						RowShards:   16,
+						IndexTables: PeriodicTableConfig{Period: 0},
+						ChunkTables: PeriodicTableConfig{Period: 0},
+					},
+				},
+			},
+			err: nil,
+		},
+		"should set shard factor defaults": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema: "v10",
+					},
+				},
+			},
+			expected: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:    "v10",
+						RowShards: 16,
+					},
+				},
+			},
+			err: nil,
+		},
+		"should not override explicit shard factor": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:    "v11",
+						RowShards: 6,
+					},
+				},
+			},
+			expected: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:    "v11",
+						RowShards: 6,
+					},
+				},
+			},
+			err: nil,
 		},
 	}
 
@@ -396,7 +469,76 @@ func TestSchemaConfig_Validate(t *testing.T) {
 
 		t.Run(testName, func(t *testing.T) {
 			actual := testData.config.Validate()
-			assert.Equal(t, testData.expected, actual)
+			assert.Equal(t, testData.err, actual)
+			if testData.expected != nil {
+				require.Equal(t, testData.expected, testData.config)
+			}
+		})
+	}
+}
+
+func TestPeriodConfig_Validate(t *testing.T) {
+	for _, tc := range []struct {
+		desc string
+		in   PeriodConfig
+		err  string
+	}{
+		{
+			desc: "ignore pre v10 sharding",
+			in: PeriodConfig{
+
+				Schema:      "v9",
+				IndexTables: PeriodicTableConfig{Period: 0},
+				ChunkTables: PeriodicTableConfig{Period: 0},
+			},
+		},
+		{
+			desc: "error on invalid schema",
+			in: PeriodConfig{
+
+				Schema:      "v99",
+				IndexTables: PeriodicTableConfig{Period: 0},
+				ChunkTables: PeriodicTableConfig{Period: 0},
+			},
+			err: "invalid schema version",
+		},
+		{
+			desc: "v10 with shard factor",
+			in: PeriodConfig{
+
+				Schema:      "v10",
+				RowShards:   16,
+				IndexTables: PeriodicTableConfig{Period: 0},
+				ChunkTables: PeriodicTableConfig{Period: 0},
+			},
+		},
+		{
+			desc: "v11 with shard factor",
+			in: PeriodConfig{
+
+				Schema:      "v11",
+				RowShards:   16,
+				IndexTables: PeriodicTableConfig{Period: 0},
+				ChunkTables: PeriodicTableConfig{Period: 0},
+			},
+		},
+		{
+			desc: "error v10 no specified shard factor",
+			in: PeriodConfig{
+
+				Schema:      "v10",
+				IndexTables: PeriodicTableConfig{Period: 0},
+				ChunkTables: PeriodicTableConfig{Period: 0},
+			},
+			err: "Must have row_shards > 0 (current: 0) for schema (v10)",
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.err == "" {
+				require.Nil(t, tc.in.validate())
+			} else {
+				require.Error(t, tc.in.validate(), tc.err)
+			}
 		})
 	}
 }
@@ -407,4 +549,31 @@ func MustParseDayTime(s string) DayTime {
 		panic(err)
 	}
 	return DayTime{model.TimeFromUnix(t.Unix())}
+}
+
+func TestPeriodicTableConfigCustomUnmarshalling(t *testing.T) {
+	yamlFile := `prefix: cortex_
+period: 1w
+tags:
+  foo: bar
+`
+
+	cfg := PeriodicTableConfig{}
+	err := yaml.Unmarshal([]byte(yamlFile), &cfg)
+	require.NoError(t, err)
+
+	expectedCfg := PeriodicTableConfig{
+		Prefix: "cortex_",
+		Period: 7 * 24 * time.Hour,
+		Tags: map[string]string{
+			"foo": "bar",
+		},
+	}
+
+	require.Equal(t, expectedCfg, cfg)
+
+	yamlGenerated, err := yaml.Marshal(&cfg)
+	require.NoError(t, err)
+
+	require.Equal(t, yamlFile, string(yamlGenerated))
 }

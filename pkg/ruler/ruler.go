@@ -34,6 +34,7 @@ import (
 	store "github.com/cortexproject/cortex/pkg/ruler/rules"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 var (
@@ -47,27 +48,44 @@ var (
 		Name:      "ruler_config_updates_total",
 		Help:      "Total number of config updates triggered by a user",
 	}, []string{"user"})
+	managersTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "cortex",
+		Name:      "ruler_managers_total",
+		Help:      "Total number of managers registered and running in the ruler",
+	})
 )
 
 // Config is the configuration for the recording rules server.
 type Config struct {
-	ExternalURL        flagext.URLValue // This is used for template expansion in alerts; must be a valid URL
-	EvaluationInterval time.Duration    // How frequently to evaluate rules by default.
-	PollInterval       time.Duration    // How frequently to poll for updated rules
-	StoreConfig        RuleStoreConfig  // Rule Storage and Polling configuration
-	RulePath           string           // Path to store rule files for prom manager
+	// This is used for template expansion in alerts; must be a valid URL.
+	ExternalURL flagext.URLValue `yaml:"external_url"`
+	// How frequently to evaluate rules by default.
+	EvaluationInterval time.Duration `yaml:"evaluation_interval"`
+	// How frequently to poll for updated rules.
+	PollInterval time.Duration `yaml:"poll_interval"`
+	// Rule Storage and Polling configuration.
+	StoreConfig RuleStoreConfig `yaml:"storage"`
+	// Path to store rule files for prom manager.
+	RulePath string `yaml:"rule_path"`
 
-	AlertmanagerURL             flagext.URLValue // URL of the Alertmanager to send notifications to.
-	AlertmanagerDiscovery       bool             // Whether to use DNS SRV records to discover alertmanagers.
-	AlertmanagerRefreshInterval time.Duration    // How long to wait between refreshing the list of alertmanagers based on DNS service discovery.
-	AlertmanangerEnableV2API    bool             // Enables the ruler notifier to use the alertmananger V2 API
-	NotificationQueueCapacity   int              // Capacity of the queue for notifications to be sent to the Alertmanager.
-	NotificationTimeout         time.Duration    // HTTP timeout duration when sending notifications to the Alertmanager.
+	// URL of the Alertmanager to send notifications to.
+	AlertmanagerURL flagext.URLValue `yaml:"alertmanager_url"`
+	// Whether to use DNS SRV records to discover alertmanagers.
+	AlertmanagerDiscovery bool `yaml:"enable_alertmanager_discovery"`
+	// How long to wait between refreshing the list of alertmanagers based on DNS service discovery.
+	AlertmanagerRefreshInterval time.Duration `yaml:"alertmanager_refresh_interval"`
+	// Enables the ruler notifier to use the alertmananger V2 API.
+	AlertmanangerEnableV2API bool `yaml:"enable_alertmanager_v2"`
+	// Capacity of the queue for notifications to be sent to the Alertmanager.
+	NotificationQueueCapacity int `yaml:"notification_queue_capacity"`
+	// HTTP timeout duration when sending notifications to the Alertmanager.
+	NotificationTimeout time.Duration `yaml:"notification_timeout"`
 
-	EnableSharding   bool // Enable sharding rule groups
-	SearchPendingFor time.Duration
-	Ring             RingConfig
-	FlushCheckPeriod time.Duration
+	// Enable sharding rule groups.
+	EnableSharding   bool          `yaml:"enable_sharding"`
+	SearchPendingFor time.Duration `yaml:"search_pending_for"`
+	Ring             RingConfig    `yaml:"ring"`
+	FlushCheckPeriod time.Duration `yaml:"flush_period"`
 
 	EnableAPI bool `yaml:"enable_api"`
 }
@@ -104,6 +122,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 // Ruler evaluates rules.
 type Ruler struct {
+	services.Service
+
 	cfg         Config
 	engine      *promql.Engine
 	queryable   promStorage.Queryable
@@ -111,8 +131,9 @@ type Ruler struct {
 	alertURL    *url.URL
 	notifierCfg *config.Config
 
-	lifecycler *ring.Lifecycler
-	ring       *ring.Ring
+	lifecycler  *ring.Lifecycler
+	ring        *ring.Ring
+	subservices *services.Manager
 
 	store          rules.RuleStore
 	mapper         *mapper
@@ -122,9 +143,6 @@ type Ruler struct {
 	// Per-user notifiers with separate queues.
 	notifiersMtx sync.Mutex
 	notifiers    map[string]*rulerNotifier
-
-	done       chan struct{}
-	terminated chan struct{}
 
 	registry prometheus.Registerer
 	logger   log.Logger
@@ -153,52 +171,53 @@ func NewRuler(cfg Config, engine *promql.Engine, queryable promStorage.Queryable
 		pusher:       pusher,
 		mapper:       newMapper(cfg.RulePath, logger),
 		userManagers: map[string]*promRules.Manager{},
-		done:         make(chan struct{}),
-		terminated:   make(chan struct{}),
 		registry:     reg,
 		logger:       logger,
 	}
 
+	ruler.Service = services.NewBasicService(ruler.starting, ruler.run, ruler.stopping)
+	return ruler, nil
+}
+
+func (r *Ruler) starting(ctx context.Context) error {
 	// If sharding is enabled, create/join a ring to distribute tokens to
 	// the ruler
-	if cfg.EnableSharding {
-		lifecyclerCfg := cfg.Ring.ToLifecyclerConfig()
-		ruler.lifecycler, err = ring.NewLifecycler(lifecyclerCfg, ruler, "ruler", ring.RulerRingKey, true)
+	if r.cfg.EnableSharding {
+		lifecyclerCfg := r.cfg.Ring.ToLifecyclerConfig()
+		var err error
+		r.lifecycler, err = ring.NewLifecycler(lifecyclerCfg, r, "ruler", ring.RulerRingKey, true)
 		if err != nil {
-			return nil, err
+			return errors.Wrap(err, "failed to initialize ruler's lifecycler")
 		}
 
-		ruler.lifecycler.Start()
-
-		ruler.ring, err = ring.New(lifecyclerCfg.RingConfig, "ruler", ring.RulerRingKey)
+		r.ring, err = ring.New(lifecyclerCfg.RingConfig, "ruler", ring.RulerRingKey)
 		if err != nil {
-			return nil, err
+			return errors.Wrap(err, "failed to initialize ruler's ring")
 		}
+
+		r.subservices, err = services.NewManager(r.lifecycler, r.ring)
+		if err == nil {
+			err = services.StartManagerAndAwaitHealthy(ctx, r.subservices)
+		}
+		return errors.Wrap(err, "failed to start ruler's services")
 	}
 
-	go ruler.run()
-	level.Info(logger).Log("msg", "ruler up and running")
-
-	return ruler, nil
+	// TODO: ideally, ruler would wait until its queryable is finished starting.
+	return nil
 }
 
 // Stop stops the Ruler.
 // Each function of the ruler is terminated before leaving the ring
-func (r *Ruler) Stop() {
-	close(r.done)
-	<-r.terminated
-
+func (r *Ruler) stopping(_ error) error {
 	r.notifiersMtx.Lock()
 	for _, n := range r.notifiers {
 		n.stop()
 	}
 	r.notifiersMtx.Unlock()
 
-	if r.cfg.EnableSharding {
-		level.Info(r.logger).Log("msg", "attempting shutdown lifecycle")
-		r.lifecycler.Shutdown()
-		level.Info(r.logger).Log("msg", "shutting down the ring")
-		r.ring.Stop()
+	if r.subservices != nil {
+		// subservices manages ring and lifecycler, if sharding was enabled.
+		_ = services.StopManagerAndAwaitStopped(context.Background(), r.subservices)
 	}
 
 	level.Info(r.logger).Log("msg", "stopping user managers")
@@ -216,6 +235,7 @@ func (r *Ruler) Stop() {
 	wg.Wait()
 	r.userManagerMtx.Unlock()
 	level.Info(r.logger).Log("msg", "all user managers stopped")
+	return nil
 }
 
 // sendAlerts implements a rules.NotifyFunc for a Notifier.
@@ -272,7 +292,7 @@ func (r *Ruler) getOrCreateNotifier(userID string) (*notifier.Manager, error) {
 			sp := ot.GlobalTracer().StartSpan("notify", ot.Tag{Key: "organization", Value: userID})
 			defer sp.Finish()
 			ctx = ot.ContextWithSpan(ctx, sp)
-			ot.GlobalTracer().Inject(sp.Context(), ot.HTTPHeaders, ot.HTTPHeadersCarrier(req.Header))
+			_ = ot.GlobalTracer().Inject(sp.Context(), ot.HTTPHeaders, ot.HTTPHeadersCarrier(req.Header))
 			return ctxhttp.Do(ctx, client, req)
 		},
 	}, util.Logger)
@@ -327,19 +347,22 @@ func (r *Ruler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (r *Ruler) run() {
-	defer close(r.terminated)
+func (r *Ruler) run(ctx context.Context) error {
+	level.Info(r.logger).Log("msg", "ruler up and running")
 
 	tick := time.NewTicker(r.cfg.PollInterval)
 	defer tick.Stop()
 
-	r.loadRules(context.Background())
+	r.loadRules(ctx)
 	for {
 		select {
-		case <-r.done:
-			return
+		case <-ctx.Done():
+			return nil
 		case <-tick.C:
-			r.loadRules(context.Background())
+			r.loadRules(ctx)
+			r.userManagerMtx.Lock()
+			managersTotal.Set(float64(len(r.userManagers)))
+			r.userManagerMtx.Unlock()
 		}
 	}
 }
@@ -469,15 +492,20 @@ func (r *Ruler) newManager(ctx context.Context, userID string) (*promRules.Manag
 
 // GetRules retrieves the running rules from this ruler and all running rulers in the ring if
 // sharding is enabled
-func (r *Ruler) GetRules(ctx context.Context, userID string) ([]*rules.RuleGroupDesc, error) {
+func (r *Ruler) GetRules(ctx context.Context) ([]*GroupStateDesc, error) {
+	userID, err := user.ExtractOrgID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("no user id found in context")
+	}
+
 	if r.cfg.EnableSharding {
-		return r.getShardedRules(ctx, userID)
+		return r.getShardedRules(ctx)
 	}
 
 	return r.getLocalRules(userID)
 }
 
-func (r *Ruler) getLocalRules(userID string) ([]*rules.RuleGroupDesc, error) {
+func (r *Ruler) getLocalRules(userID string) ([]*GroupStateDesc, error) {
 	var groups []*promRules.Group
 	r.userManagerMtx.Lock()
 	if mngr, exists := r.userManagers[userID]; exists {
@@ -485,16 +513,20 @@ func (r *Ruler) getLocalRules(userID string) ([]*rules.RuleGroupDesc, error) {
 	}
 	r.userManagerMtx.Unlock()
 
-	groupDescs := make([]*rules.RuleGroupDesc, 0, len(groups))
+	groupDescs := make([]*GroupStateDesc, 0, len(groups))
 	prefix := filepath.Join(r.cfg.RulePath, userID) + "/"
 
 	for _, group := range groups {
 		interval := group.Interval()
-		groupDesc := &rules.RuleGroupDesc{
-			Name:      group.Name(),
-			Namespace: strings.TrimPrefix(group.File(), prefix),
-			Interval:  interval,
-			User:      userID,
+		groupDesc := &GroupStateDesc{
+			Group: &rules.RuleGroupDesc{
+				Name:      group.Name(),
+				Namespace: strings.TrimPrefix(group.File(), prefix),
+				Interval:  interval,
+				User:      userID,
+			},
+			EvaluationTimestamp: group.GetEvaluationTimestamp(),
+			EvaluationDuration:  group.GetEvaluationDuration(),
 		}
 		for _, r := range group.Rules() {
 			lastError := ""
@@ -502,13 +534,13 @@ func (r *Ruler) getLocalRules(userID string) ([]*rules.RuleGroupDesc, error) {
 				lastError = r.LastError().Error()
 			}
 
-			var ruleDesc *rules.RuleDesc
+			var ruleDesc *RuleStateDesc
 			switch rule := r.(type) {
 			case *promRules.AlertingRule:
 				rule.ActiveAlerts()
-				alerts := []*rules.AlertDesc{}
+				alerts := []*AlertStateDesc{}
 				for _, a := range rule.ActiveAlerts() {
-					alerts = append(alerts, &rules.AlertDesc{
+					alerts = append(alerts, &AlertStateDesc{
 						State:       a.State.String(),
 						Labels:      client.FromLabelsToLabelAdapters(a.Labels),
 						Annotations: client.FromLabelsToLabelAdapters(a.Annotations),
@@ -520,36 +552,44 @@ func (r *Ruler) getLocalRules(userID string) ([]*rules.RuleGroupDesc, error) {
 						ValidUntil:  a.ValidUntil,
 					})
 				}
-				ruleDesc = &rules.RuleDesc{
-					State:       rule.State().String(),
-					Alert:       rule.Name(),
-					Alerts:      alerts,
-					Expr:        rule.Query().String(),
-					For:         rule.Duration(),
-					Labels:      client.FromLabelsToLabelAdapters(rule.Labels()),
-					Annotations: client.FromLabelsToLabelAdapters(rule.Annotations()),
-					Health:      string(rule.Health()),
-					LastError:   lastError,
+				ruleDesc = &RuleStateDesc{
+					Rule: &rules.RuleDesc{
+						Expr:        rule.Query().String(),
+						Alert:       rule.Name(),
+						For:         rule.Duration(),
+						Labels:      client.FromLabelsToLabelAdapters(rule.Labels()),
+						Annotations: client.FromLabelsToLabelAdapters(rule.Annotations()),
+					},
+					State:               rule.State().String(),
+					Health:              string(rule.Health()),
+					LastError:           lastError,
+					Alerts:              alerts,
+					EvaluationTimestamp: rule.GetEvaluationTimestamp(),
+					EvaluationDuration:  rule.GetEvaluationDuration(),
 				}
 			case *promRules.RecordingRule:
-				ruleDesc = &rules.RuleDesc{
-					Record:    rule.Name(),
-					Expr:      rule.Query().String(),
-					Labels:    client.FromLabelsToLabelAdapters(rule.Labels()),
-					Health:    string(rule.Health()),
-					LastError: lastError,
+				ruleDesc = &RuleStateDesc{
+					Rule: &rules.RuleDesc{
+						Record: rule.Name(),
+						Expr:   rule.Query().String(),
+						Labels: client.FromLabelsToLabelAdapters(rule.Labels()),
+					},
+					Health:              string(rule.Health()),
+					LastError:           lastError,
+					EvaluationTimestamp: rule.GetEvaluationTimestamp(),
+					EvaluationDuration:  rule.GetEvaluationDuration(),
 				}
 			default:
 				return nil, errors.Errorf("failed to assert type of rule '%v'", rule.Name())
 			}
-			groupDesc.Rules = append(groupDesc.Rules, ruleDesc)
+			groupDesc.ActiveRules = append(groupDesc.ActiveRules, ruleDesc)
 		}
 		groupDescs = append(groupDescs, groupDesc)
 	}
 	return groupDescs, nil
 }
 
-func (r *Ruler) getShardedRules(ctx context.Context, userID string) ([]*rules.RuleGroupDesc, error) {
+func (r *Ruler) getShardedRules(ctx context.Context) ([]*GroupStateDesc, error) {
 	rulers, err := r.ring.GetAll()
 	if err != nil {
 		return nil, err
@@ -560,7 +600,7 @@ func (r *Ruler) getShardedRules(ctx context.Context, userID string) ([]*rules.Ru
 		return nil, fmt.Errorf("unable to inject user ID into grpc request, %v", err)
 	}
 
-	rgs := []*rules.RuleGroupDesc{}
+	rgs := []*GroupStateDesc{}
 
 	for _, rlr := range rulers.Ingesters {
 		conn, err := grpc.Dial(rlr.Addr, grpc.WithInsecure())

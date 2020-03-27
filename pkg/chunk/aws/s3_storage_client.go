@@ -1,26 +1,24 @@
 package aws
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
+	"net/http"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/prometheus/client_golang/prometheus"
-
 	awscommon "github.com/weaveworks/common/aws"
 	"github.com/weaveworks/common/instrument"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/chunk/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
@@ -60,10 +58,11 @@ func (cfg *S3Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 type S3ObjectClient struct {
 	bucketNames []string
 	S3          s3iface.S3API
+	delimiter   string
 }
 
 // NewS3ObjectClient makes a new S3-backed ObjectClient.
-func NewS3ObjectClient(cfg S3Config) (*S3ObjectClient, error) {
+func NewS3ObjectClient(cfg S3Config, delimiter string) (*S3ObjectClient, error) {
 	if cfg.S3.URL == nil {
 		return nil, fmt.Errorf("no URL specified for S3")
 	}
@@ -75,6 +74,7 @@ func NewS3ObjectClient(cfg S3Config) (*S3ObjectClient, error) {
 	s3Config = s3Config.WithS3ForcePathStyle(cfg.S3ForcePathStyle) // support for Path Style S3 url if has the flag
 
 	s3Config = s3Config.WithMaxRetries(0) // We do our own retries, so we can monitor them
+	s3Config = s3Config.WithHTTPClient(&http.Client{Transport: defaultTransport})
 	sess, err := session.NewSession(s3Config)
 	if err != nil {
 		return nil, err
@@ -87,68 +87,31 @@ func NewS3ObjectClient(cfg S3Config) (*S3ObjectClient, error) {
 	client := S3ObjectClient{
 		S3:          s3Client,
 		bucketNames: bucketNames,
+		delimiter:   delimiter,
 	}
 	return &client, nil
 }
 
-func (a *S3ObjectClient) Stop() {
-}
+// Stop fulfills the chunk.ObjectClient interface
+func (a *S3ObjectClient) Stop() {}
 
-func (a *S3ObjectClient) GetChunks(ctx context.Context, chunks []chunk.Chunk) ([]chunk.Chunk, error) {
-	return util.GetParallelChunks(ctx, chunks, a.getChunk)
-}
+// DeleteObject deletes the specified objectKey from the appropriate S3 bucket
+func (a *S3ObjectClient) DeleteObject(ctx context.Context, objectKey string) error {
+	_, err := a.S3.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(a.bucketFromKey(objectKey)),
+		Key:    aws.String(objectKey),
+	})
 
-func (a *S3ObjectClient) getChunk(ctx context.Context, decodeContext *chunk.DecodeContext, c chunk.Chunk) (chunk.Chunk, error) {
-	readCloser, err := a.GetObject(ctx, c.ExternalKey())
 	if err != nil {
-		return chunk.Chunk{}, err
-	}
-
-	defer readCloser.Close()
-
-	buf, err := ioutil.ReadAll(readCloser)
-	if err != nil {
-		return chunk.Chunk{}, err
-	}
-
-	if err := c.Decode(decodeContext, buf); err != nil {
-		return chunk.Chunk{}, err
-	}
-	return c, nil
-}
-
-func (a *S3ObjectClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) error {
-	var (
-		s3ChunkKeys []string
-		s3ChunkBufs [][]byte
-	)
-
-	for i := range chunks {
-		buf, err := chunks[i].Encoded()
-		if err != nil {
-			return err
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() == s3.ErrCodeNoSuchKey {
+				return chunk.ErrStorageObjectNotFound
+			}
 		}
-		key := chunks[i].ExternalKey()
-
-		s3ChunkKeys = append(s3ChunkKeys, key)
-		s3ChunkBufs = append(s3ChunkBufs, buf)
+		return err
 	}
 
-	incomingErrors := make(chan error)
-	for i := range s3ChunkBufs {
-		go func(i int) {
-			incomingErrors <- a.PutObject(ctx, s3ChunkKeys[i], bytes.NewReader(s3ChunkBufs[i]))
-		}(i)
-	}
-
-	var lastErr error
-	for range s3ChunkKeys {
-		err := <-incomingErrors
-		if err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
+	return nil
 }
 
 // bucketFromKey maps a key to a bucket name
@@ -158,13 +121,14 @@ func (a *S3ObjectClient) bucketFromKey(key string) string {
 	}
 
 	hasher := fnv.New32a()
-	hasher.Write([]byte(key))
+	hasher.Write([]byte(key)) //nolint: errcheck
 	hash := hasher.Sum32()
 
 	return a.bucketNames[hash%uint32(len(a.bucketNames))]
 }
 
-// Get object from the store
+// GetObject returns a reader for the specified object key from the configured S3 bucket. If the
+// key does not exist a generic chunk.ErrStorageObjectNotFound error is returned.
 func (a *S3ObjectClient) GetObject(ctx context.Context, objectKey string) (io.ReadCloser, error) {
 	var resp *s3.GetObjectOutput
 
@@ -179,7 +143,13 @@ func (a *S3ObjectClient) GetObject(ctx context.Context, objectKey string) (io.Re
 		})
 		return err
 	})
+
 	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() == s3.ErrCodeNoSuchKey {
+				return nil, chunk.ErrStorageObjectNotFound
+			}
+		}
 		return nil, err
 	}
 
@@ -207,7 +177,7 @@ func (a *S3ObjectClient) List(ctx context.Context, prefix string) ([]chunk.Stora
 			input := s3.ListObjectsV2Input{
 				Bucket:    aws.String(a.bucketNames[i]),
 				Prefix:    aws.String(prefix),
-				Delimiter: aws.String(chunk.DirDelim),
+				Delimiter: aws.String(a.delimiter),
 			}
 
 			for {

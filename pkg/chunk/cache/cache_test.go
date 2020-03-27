@@ -22,11 +22,11 @@ const userID = "1"
 func fillCache(t *testing.T, cache cache.Cache) ([]string, []chunk.Chunk) {
 	const chunkLen = 13 * 3600 // in seconds
 
-	// put 100 chunks from 0 to 99
+	// put a set of chunks, larger than background batch size, with varying timestamps and values
 	keys := []string{}
 	bufs := [][]byte{}
 	chunks := []chunk.Chunk{}
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 111; i++ {
 		ts := model.TimeFromUnix(int64(i * chunkLen))
 		promChunk := prom_chunk.New()
 		nc, err := promChunk.Add(model.SamplePair{
@@ -52,9 +52,24 @@ func fillCache(t *testing.T, cache cache.Cache) ([]string, []chunk.Chunk) {
 		buf, err := c.Encoded()
 		require.NoError(t, err)
 
+		// In order to be able to compare the expected chunk (this one) with the
+		// actual one (the one that will be fetched from the cache) we need to
+		// cleanup the chunk to avoid any internal references mismatch (ie. appender
+		// pointer).
+		cleanChunk := chunk.Chunk{
+			UserID:      c.UserID,
+			Fingerprint: c.Fingerprint,
+			From:        c.From,
+			Through:     c.Through,
+			Checksum:    c.Checksum,
+			ChecksumSet: c.ChecksumSet,
+		}
+		err = cleanChunk.Decode(chunk.NewDecodeContext(), buf)
+		require.NoError(t, err)
+
 		keys = append(keys, c.ExternalKey())
 		bufs = append(bufs, buf)
-		chunks = append(chunks, c)
+		chunks = append(chunks, cleanChunk)
 	}
 
 	cache.Store(context.Background(), keys, bufs)
@@ -75,7 +90,7 @@ func testCacheSingle(t *testing.T, cache cache.Cache, keys []string, chunks []ch
 		require.NoError(t, err)
 		err = c.Decode(chunk.NewDecodeContext(), bufs[0])
 		require.NoError(t, err)
-		require.Equal(t, c, chunks[index])
+		require.Equal(t, chunks[index], c)
 	}
 }
 
@@ -98,9 +113,7 @@ func testCacheMultiple(t *testing.T, cache cache.Cache, keys []string, chunks []
 }
 
 func testChunkFetcher(t *testing.T, c cache.Cache, keys []string, chunks []chunk.Chunk) {
-	fetcher, err := chunk.NewChunkFetcher(cache.Config{
-		Cache: c,
-	}, false, nil)
+	fetcher, err := chunk.NewChunkFetcher(c, false, nil)
 	require.NoError(t, err)
 	defer fetcher.Stop()
 
@@ -119,7 +132,7 @@ func (a byExternalKey) Less(i, j int) bool { return a[i].ExternalKey() < a[j].Ex
 
 func testCacheMiss(t *testing.T, cache cache.Cache) {
 	for i := 0; i < 100; i++ {
-		key := strconv.Itoa(rand.Int())
+		key := strconv.Itoa(rand.Int()) // arbitrary key which should fail: no chunk key is a single integer
 		found, bufs, missing := cache.Fetch(context.Background(), []string{key})
 		require.Empty(t, found)
 		require.Empty(t, bufs)

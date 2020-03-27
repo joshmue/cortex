@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -20,7 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/prometheus/client_golang/prometheus"
-
 	awscommon "github.com/weaveworks/common/aws"
 	"github.com/weaveworks/common/instrument"
 
@@ -98,13 +99,13 @@ func init() {
 
 // DynamoDBConfig specifies config for a DynamoDB database.
 type DynamoDBConfig struct {
-	DynamoDB               flagext.URLValue
-	APILimit               float64
-	ThrottleLimit          float64
-	ApplicationAutoScaling flagext.URLValue
-	Metrics                MetricsAutoScalingConfig
-	ChunkGangSize          int
-	ChunkGetMaxParallelism int
+	DynamoDB               flagext.URLValue         `yaml:"dynamodb_url"`
+	APILimit               float64                  `yaml:"api_limit"`
+	ThrottleLimit          float64                  `yaml:"throttle_limit"`
+	ApplicationAutoScaling flagext.URLValue         `yaml:"application_autoscaling_url"`
+	Metrics                MetricsAutoScalingConfig `yaml:"metrics"`
+	ChunkGangSize          int                      `yaml:"chunk_gang_size"`
+	ChunkGetMaxParallelism int                      `yaml:"chunk_get_max_parallelism"`
 	backoffConfig          util.BackoffConfig
 }
 
@@ -115,8 +116,8 @@ func (cfg *DynamoDBConfig) RegisterFlags(f *flag.FlagSet) {
 	f.Float64Var(&cfg.APILimit, "dynamodb.api-limit", 2.0, "DynamoDB table management requests per second limit.")
 	f.Float64Var(&cfg.ThrottleLimit, "dynamodb.throttle-limit", 10.0, "DynamoDB rate cap to back off when throttled.")
 	f.Var(&cfg.ApplicationAutoScaling, "applicationautoscaling.url", "ApplicationAutoscaling endpoint URL with escaped Key and Secret encoded.")
-	f.IntVar(&cfg.ChunkGangSize, "dynamodb.chunk.gang.size", 10, "Number of chunks to group together to parallelise fetches (zero to disable)")
-	f.IntVar(&cfg.ChunkGetMaxParallelism, "dynamodb.chunk.get.max.parallelism", 32, "Max number of chunk-get operations to start in parallel")
+	f.IntVar(&cfg.ChunkGangSize, "dynamodb.chunk-gang-size", 10, "Number of chunks to group together to parallelise fetches (zero to disable)")
+	f.IntVar(&cfg.ChunkGetMaxParallelism, "dynamodb.chunk.get-max-parallelism", 32, "Max number of chunk-get operations to start in parallel")
 	f.DurationVar(&cfg.backoffConfig.MinBackoff, "dynamodb.min-backoff", 100*time.Millisecond, "Minimum backoff time")
 	f.DurationVar(&cfg.backoffConfig.MaxBackoff, "dynamodb.max-backoff", 50*time.Second, "Maximum backoff time")
 	f.IntVar(&cfg.backoffConfig.MaxRetries, "dynamodb.max-retries", 20, "Maximum number of times to retry an operation")
@@ -125,8 +126,8 @@ func (cfg *DynamoDBConfig) RegisterFlags(f *flag.FlagSet) {
 
 // StorageConfig specifies config for storing data on AWS.
 type StorageConfig struct {
-	DynamoDBConfig
-	S3Config `yaml:",inline"`
+	DynamoDBConfig `yaml:"dynamodb"`
+	S3Config       `yaml:",inline"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -155,12 +156,12 @@ func NewDynamoDBIndexClient(cfg DynamoDBConfig, schemaCfg chunk.SchemaConfig) (c
 	return newDynamoDBStorageClient(cfg, schemaCfg)
 }
 
-// NewDynamoDBObjectClient makes a new DynamoDB-backed ObjectClient.
-func NewDynamoDBObjectClient(cfg DynamoDBConfig, schemaCfg chunk.SchemaConfig) (chunk.ObjectClient, error) {
+// NewDynamoDBChunkClient makes a new DynamoDB-backed chunk.Client.
+func NewDynamoDBChunkClient(cfg DynamoDBConfig, schemaCfg chunk.SchemaConfig) (chunk.Client, error) {
 	return newDynamoDBStorageClient(cfg, schemaCfg)
 }
 
-// newDynamoDBStorageClient makes a new DynamoDB-backed IndexClient and ObjectClient.
+// newDynamoDBStorageClient makes a new DynamoDB-backed IndexClient and chunk.Client.
 func newDynamoDBStorageClient(cfg DynamoDBConfig, schemaCfg chunk.SchemaConfig) (*dynamoDBStorageClient, error) {
 	dynamoDB, err := dynamoClientFromURL(cfg.DynamoDB.URL)
 	if err != nil {
@@ -246,7 +247,7 @@ func (a dynamoDBStorageClient) BatchWrite(ctx context.Context, input chunk.Write
 			if awsErr, ok := err.(awserr.Error); ok && ((awsErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException) || request.Retryable()) {
 				logWriteRetry(ctx, requests)
 				unprocessed.TakeReqs(requests, -1)
-				a.writeThrottle.WaitN(ctx, len(requests))
+				_ = a.writeThrottle.WaitN(ctx, len(requests))
 				backoff.Wait()
 				continue
 			} else if ok && awsErr.Code() == validationException {
@@ -270,7 +271,7 @@ func (a dynamoDBStorageClient) BatchWrite(ctx context.Context, input chunk.Write
 		unprocessedItems := dynamoDBWriteBatch(resp.UnprocessedItems)
 		if len(unprocessedItems) > 0 {
 			logWriteRetry(ctx, unprocessedItems)
-			a.writeThrottle.WaitN(ctx, unprocessedItems.Len())
+			_ = a.writeThrottle.WaitN(ctx, unprocessedItems.Len())
 			unprocessed.TakeReqs(unprocessedItems, -1)
 		}
 
@@ -462,7 +463,7 @@ type chunksPlusError struct {
 	err    error
 }
 
-// GetChunks implements chunk.ObjectClient.
+// GetChunks implements chunk.Client.
 func (a dynamoDBStorageClient) GetChunks(ctx context.Context, chunks []chunk.Chunk) ([]chunk.Chunk, error) {
 	log, ctx := spanlogger.New(ctx, "GetChunks.DynamoDB", ot.Tag{Key: "numChunks", Value: len(chunks)})
 	defer log.Span.Finish()
@@ -599,6 +600,11 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 	return result, nil
 }
 
+func (a dynamoDBStorageClient) DeleteChunk(ctx context.Context, chunkID string) error {
+	// ToDo: implement this to support deleting chunks from DynamoDB
+	return chunk.ErrMethodNotImplemented
+}
+
 func processChunkResponse(response *dynamodb.BatchGetItemOutput, chunksByKey map[string]chunk.Chunk) ([]chunk.Chunk, error) {
 	result := []chunk.Chunk{}
 	decodeContext := chunk.NewDecodeContext()
@@ -640,7 +646,7 @@ func (a dynamoDBStorageClient) PutChunkAndIndex(ctx context.Context, c chunk.Chu
 	return a.BatchWrite(ctx, dynamoDBWrites)
 }
 
-// PutChunks implements chunk.ObjectClient.
+// PutChunks implements chunk.Client.
 func (a dynamoDBStorageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) error {
 	dynamoDBWrites, err := a.writesForChunks(chunks)
 	if err != nil {
@@ -750,6 +756,11 @@ func (b dynamoDBWriteBatch) Add(tableName, hashValue string, rangeValue []byte, 
 	})
 }
 
+func (b dynamoDBWriteBatch) Delete(tableName, hashValue string, rangeValue []byte) {
+	// ToDo: implement this to support deleting index entries from DynamoDB
+	panic("DynamoDB does not support Deleting index entries yet")
+}
+
 // Fill 'b' with WriteRequests from 'from' until 'b' has at most max requests. Remove those requests from 'from'.
 func (b dynamoDBWriteBatch) TakeReqs(from dynamoDBWriteBatch, max int) {
 	outLen, inLen := b.Len(), from.Len()
@@ -856,5 +867,23 @@ func awsSessionFromURL(awsURL *url.URL) (client.ConfigProvider, error) {
 		return nil, err
 	}
 	config = config.WithMaxRetries(0) // We do our own retries, so we can monitor them
+	config = config.WithHTTPClient(&http.Client{Transport: defaultTransport})
 	return session.NewSession(config)
+}
+
+// Copy-pasted http.DefaultTransport
+var defaultTransport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2: true,
+	MaxIdleConns:      100,
+	// We will connect many times in parallel to the same DynamoDB server,
+	// see https://github.com/golang/go/issues/13801
+	MaxIdleConnsPerHost:   100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
 }

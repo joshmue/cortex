@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/thanos/pkg/objstore/gcs"
+	"github.com/thanos-io/thanos/pkg/objstore/s3"
 	yaml "gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/util"
@@ -69,7 +69,7 @@ func TestNewBucketClient(t *testing.T) {
 		},
 		"should return error on unknown backend": {
 			config:       configWithUnknownBackend,
-			expectedErr:  errUnsupportedBackend,
+			expectedErr:  errUnsupportedStorageBackend,
 			expectedType: nil,
 		},
 	}

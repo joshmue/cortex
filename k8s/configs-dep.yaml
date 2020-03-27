@@ -15,12 +15,12 @@ spec:
     spec:
       containers:
       - name: configs
-        image: quay.io/cortexproject/cortex
+        image: quay.io/cortexproject/cortex:v0.7.0
         imagePullPolicy: IfNotPresent
         args:
         - -target=configs
         - -server.http-listen-port=80
-        - -database.uri=postgres://postgres@configs-db.default.svc.cluster.local/configs?sslmode=disable
-        - -database.migrations=/migrations
+        - -configs.database.uri=postgres://postgres@configs-db.default.svc.cluster.local/configs?sslmode=disable
+        - -configs.database.migrations-dir=/migrations
         ports:
         - containerPort: 80

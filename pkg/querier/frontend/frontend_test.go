@@ -2,10 +2,12 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,13 +20,14 @@ import (
 	"github.com/stretchr/testify/require"
 	jaeger "github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/config"
+	"github.com/weaveworks/common/httpgrpc"
 	httpgrpc_server "github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/util/flagext"
-	"github.com/cortexproject/cortex/pkg/util/validation"
+	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
 const (
@@ -34,7 +37,8 @@ const (
 
 func TestFrontend(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello World"))
+		_, err := w.Write([]byte("Hello World"))
+		require.NoError(t, err)
 	})
 	test := func(addr string) {
 		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/", addr), nil)
@@ -68,7 +72,8 @@ func TestFrontendPropagateTrace(t *testing.T) {
 		traceID := fmt.Sprintf("%v", sp.Context().(jaeger.SpanContext).TraceID())
 		observedTraceID <- traceID
 
-		w.Write([]byte(responseBody))
+		_, err = w.Write([]byte(responseBody))
+		require.NoError(t, err)
 	}))
 
 	test := func(addr string) {
@@ -133,12 +138,22 @@ func TestFrontendCancel(t *testing.T) {
 	testFrontend(t, handler, test)
 }
 
-func defaultOverrides(t *testing.T) *validation.Overrides {
-	var limits validation.Limits
-	flagext.DefaultValues(&limits)
-	overrides, err := validation.NewOverrides(limits, nil)
-	require.NoError(t, err)
-	return overrides
+func TestFrontendCancelStatusCode(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		err    error
+	}{
+		{http.StatusInternalServerError, errors.New("unknown")},
+		{http.StatusGatewayTimeout, context.DeadlineExceeded},
+		{StatusClientClosedRequest, context.Canceled},
+		{http.StatusBadRequest, httpgrpc.Errorf(http.StatusBadRequest, "")},
+	} {
+		t.Run(test.err.Error(), func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeError(w, test.err)
+			require.Equal(t, test.status, w.Result().StatusCode)
+		})
+	}
 }
 
 func testFrontend(t *testing.T, handler http.Handler, test func(addr string)) {
@@ -159,7 +174,7 @@ func testFrontend(t *testing.T, handler http.Handler, test func(addr string)) {
 	httpListen, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
-	frontend, err := New(config, logger)
+	frontend, err := New(config, logger, nil)
 	require.NoError(t, err)
 	defer frontend.Close()
 
@@ -176,14 +191,16 @@ func testFrontend(t *testing.T, handler http.Handler, test func(addr string)) {
 			middleware.Tracer{},
 		).Wrap(frontend.Handler()),
 	}
-	defer httpServer.Shutdown(context.Background())
+	defer httpServer.Shutdown(context.Background()) //nolint:errcheck
 
-	go httpServer.Serve(httpListen)
-	go grpcServer.Serve(grpcListen)
+	go httpServer.Serve(httpListen) //nolint:errcheck
+	go grpcServer.Serve(grpcListen) //nolint:errcheck
 
 	worker, err := NewWorker(workerConfig, httpgrpc_server.NewServer(handler), logger)
 	require.NoError(t, err)
-	defer worker.Stop()
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), worker))
 
 	test(httpListen.Addr().String())
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), worker))
 }
